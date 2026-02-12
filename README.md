@@ -34,4 +34,4 @@ By submitting a pull request (or otherwise contributing code), you agree that yo
 
 ---
 
-Copyright (c) {{YEAR}} {{COPYRIGHT_HOLDER}}
+Copyright (c) 2026 Johannes Blaschke
