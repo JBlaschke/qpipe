@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Minimal networked MPMC "work queue" channel:
 //! - Many producers send binary frames to an orchestrator.
 //! - Many consumers receive frames; each frame is delivered to exactly one consumer.

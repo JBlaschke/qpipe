@@ -5,4 +5,5 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+base64 = "0.22.1"
 rand = "0.10.0"
