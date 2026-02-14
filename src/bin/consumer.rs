@@ -29,9 +29,15 @@ fn main() -> io::Result<()> {
     loop {
         let msg = c.recv()?;
         if let Ok(s) = std::str::from_utf8(&msg) {
-            println!("msg ({} bytes) utf8: {}", msg.len(), s);
+            println!(
+                "msg ({} bytes) utf8: {}",
+                msg.len(), s
+            );
         } else {
-            println!("msg ({} bytes) hex: {}", msg.len(), hex_preview(&msg, 32));
+            println!(
+                "msg ({} bytes) hex: {}",
+                msg.len(), hex_preview(&msg, 32)
+            );
         }
     }
 }

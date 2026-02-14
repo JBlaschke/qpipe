@@ -26,10 +26,15 @@ fn main() -> io::Result<()> {
             "--jsonl" => {
                 // Validate UTF-8 so Nu isn't fed broken text.
                 let s = std::str::from_utf8(&msg)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "payload not valid UTF-8"))?;
+                    .map_err(
+                        |_| io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "payload not valid UTF-8"
+                        )
+                    )?;
 
-                // Ensure exactly one line per message (NDJSON style).
-                // If your producers might send pretty-printed JSON with newlines,
+                // Ensure exactly one line per message (NDJSON style). If your
+                // producers might send pretty-printed JSON with newlines,
                 // either compact it before sending, or switch to --base64.
                 if s.contains('\n') {
                     return Err(io::Error::new(

@@ -20,7 +20,11 @@ pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
     addr.to_socket_addrs()?
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve address"))
+        .ok_or_else(
+            || io::Error::new(
+                io::ErrorKind::InvalidInput, "could not resolve address"
+            )
+        )
 }
 
 fn read_port_token<R: Read>(r: &mut R) -> io::Result<(u16, [u8; TOKEN_LEN])> {
@@ -33,7 +37,11 @@ fn read_port_token<R: Read>(r: &mut R) -> io::Result<(u16, [u8; TOKEN_LEN])> {
     Ok((port, token))
 }
 
-fn connect_data(orchestrator_ctrl: SocketAddr, port: u16, token: [u8; TOKEN_LEN]) -> io::Result<TcpStream> {
+fn connect_data(
+            orchestrator_ctrl: SocketAddr,
+            port: u16,
+            token: [u8; TOKEN_LEN]
+        ) -> io::Result<TcpStream> {
     let data_addr = SocketAddr::new(orchestrator_ctrl.ip(), port);
     let mut s = TcpStream::connect(data_addr)?;
     s.set_nodelay(true).ok();
@@ -65,7 +73,11 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "incoming frame too large"));
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidData, "incoming frame too large"
+            )
+        );
     }
 
     let mut payload = vec![0u8; len];

@@ -131,7 +131,9 @@ fn main() -> io::Result<()> {
     {
         let stats = stats.clone();
         let queue = queue.clone();
-        thread::spawn(move || stats_reporter(stats, queue, Duration::from_secs(1)));
+        thread::spawn(
+            move || stats_reporter(stats, queue, Duration::from_secs(1))
+        );
     }
 
     let listener = TcpListener::bind(&listen_addr)?;
@@ -160,7 +162,11 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn stats_reporter(stats: Arc<Stats>, queue: Arc<SharedQueue>, every: Duration) {
+fn stats_reporter(
+            stats: Arc<Stats>,
+            queue: Arc<SharedQueue>,
+            every: Duration
+        ) {
     let mut last_posted_msgs = 0u64;
     let mut last_posted_bytes = 0u64;
     let mut last_collected_msgs = 0u64;
@@ -206,7 +212,11 @@ fn stats_reporter(stats: Arc<Stats>, queue: Arc<SharedQueue>, every: Duration) {
     }
 }
 
-fn handle_control(mut ctrl: TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stats>) -> io::Result<()> {
+fn handle_control(
+            mut ctrl: TcpStream,
+            queue: Arc<SharedQueue>,
+            stats: Arc<Stats>
+        ) -> io::Result<()> {
     ctrl.set_nodelay(true).ok();
 
     // Read role byte.
@@ -215,7 +225,9 @@ fn handle_control(mut ctrl: TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stats
     let role = role[0];
 
     if role != ROLE_PRODUCER && role != ROLE_CONSUMER {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown role byte"));
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "unknown role byte")
+        );
     }
 
     // Bind ephemeral port on same IP family as the control socket.
@@ -223,7 +235,8 @@ fn handle_control(mut ctrl: TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stats
     let data_listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))?;
     let port = data_listener.local_addr()?.port();
 
-    // Session token to prevent accidental/hijacked connects to the ephemeral port.
+    // Session token to prevent accidental/hijacked connects to the ephemeral
+    // port.
     let mut token = [0u8; TOKEN_LEN];
     //OsRng.fill_bytes(&mut token);
     SysRng.try_fill_bytes(&mut token).map_err(
@@ -246,7 +259,9 @@ fn handle_control(mut ctrl: TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stats
         match s.read_exact(&mut got) {
             Ok(()) if got == token => {
                 s.set_read_timeout(None).ok();
-                eprintln!("client {peer} authenticated on ephemeral port {port}");
+                eprintln!(
+                    "client {peer} authenticated on ephemeral port {port}"
+                );
                 break s;
             }
             _ => continue,
@@ -261,7 +276,11 @@ fn handle_control(mut ctrl: TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stats
     }
 }
 
-fn run_producer(stream: &mut TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stats>) -> io::Result<()> {
+fn run_producer(
+            stream: &mut TcpStream,
+            queue: Arc<SharedQueue>,
+            stats: Arc<Stats>
+        ) -> io::Result<()> {
     let _guard = ConnGuard::new(ConnKind::Producer, stats.clone());
 
     loop {
@@ -277,7 +296,11 @@ fn run_producer(stream: &mut TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stat
     }
 }
 
-fn run_consumer(stream: &mut TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stats>) -> io::Result<()> {
+fn run_consumer(
+            stream: &mut TcpStream,
+            queue: Arc<SharedQueue>,
+            stats: Arc<Stats>
+        ) -> io::Result<()> {
     let _guard = ConnGuard::new(ConnKind::Consumer, stats.clone());
 
     loop {
@@ -286,13 +309,15 @@ fn run_consumer(stream: &mut TcpStream, queue: Arc<SharedQueue>, stats: Arc<Stat
 
         match write_frame(stream, &msg) {
             Ok(()) => {
-                // “Collected” here means “successfully written to the consumer socket.”
+                // “Collected” here means “successfully written to the consumer
+                // socket.”
                 stats.collected_msgs.fetch_add(1, Ordering::Relaxed);
                 stats.collected_bytes.fetch_add(len, Ordering::Relaxed);
                 stream.flush().ok();
             }
             Err(e) => {
-                // At-most-once semantics: popped message is dropped if consumer dies mid-send.
+                // At-most-once semantics: popped message is dropped if consumer
+                // dies mid-send.
                 stats.dropped_msgs.fetch_add(1, Ordering::Relaxed);
                 stats.dropped_bytes.fetch_add(len, Ordering::Relaxed);
 
