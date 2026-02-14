@@ -4,14 +4,21 @@ use std::io::{self, BufRead};
 
 use qpipe::Producer;
 
+use log::info;
+
 fn main() -> io::Result<()> {
+    // By default emit warnings
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn")
+    ).init();
+
     let orchestrator = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:7000".to_string());
 
     let mut p = Producer::connect(&orchestrator)?;
-    eprintln!("producer connected via {orchestrator}");
-    eprintln!("type lines; each line becomes one binary frame");
+    info!("producer connected via {}", orchestrator);
+    info!("type lines; each line becomes one binary frame");
 
     for line in io::stdin().lock().lines() {
         let line = line?;

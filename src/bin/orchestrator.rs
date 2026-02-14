@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use rand::{rngs::SysRng, TryRng};
 
+use log::{info, warn};
+
 use qpipe::{read_frame, write_frame, ROLE_CONSUMER, ROLE_PRODUCER, TOKEN_LEN};
 
 #[derive(Default)]
@@ -116,6 +118,11 @@ impl SharedQueue {
 }
 
 fn main() -> io::Result<()> {
+    // By default emit warnings
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn")
+    ).init();
+
     let listen_addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:7000".to_string());
@@ -137,7 +144,7 @@ fn main() -> io::Result<()> {
     }
 
     let listener = TcpListener::bind(&listen_addr)?;
-    eprintln!(
+    info!(
         "orchestrator control listening on {} (queue capacity {})",
         listener.local_addr()?,
         capacity
@@ -151,11 +158,11 @@ fn main() -> io::Result<()> {
                 let stats = stats.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_control(stream, queue, stats) {
-                        eprintln!("session error: {e}");
+                        warn!("session error: {}", e);
                     }
                 });
             }
-            Err(e) => eprintln!("control accept error: {e}"),
+            Err(e) => warn!("control accept error: {}", e),
         }
     }
 
@@ -203,7 +210,7 @@ fn stats_reporter(
         let cons = stats.active_consumers.load(Ordering::Relaxed);
 
         // One compact line per interval; goes to stderr.
-        eprintln!(
+        info!(
             "[stats] +{dm_posted} msg/s ({db_posted} B/s) posted | \
              +{dm_collected} msg/s ({db_collected} B/s) collected | \
              +{dm_dropped} msg/s ({db_dropped} B/s) dropped | \
@@ -259,8 +266,8 @@ fn handle_control(
         match s.read_exact(&mut got) {
             Ok(()) if got == token => {
                 s.set_read_timeout(None).ok();
-                eprintln!(
-                    "client {peer} authenticated on ephemeral port {port}"
+                info!(
+                    "client {} authenticated on ephemeral port {}", peer, port
                 );
                 break s;
             }
