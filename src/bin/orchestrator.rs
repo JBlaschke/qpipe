@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rand::{rngs::SysRng, TryRng};
 
-use log::{info, warn};
+use log::{debug, info, warn, error};
 
 use qpipe::{read_frame, write_frame, ROLE_CONSUMER, ROLE_PRODUCER, TOKEN_LEN};
 
@@ -145,7 +145,7 @@ fn main() -> io::Result<()> {
 
     let listener = TcpListener::bind(&listen_addr)?;
     info!(
-        "orchestrator control listening on {} (queue capacity {})",
+        "Orchestrator control listening on {} (queue capacity {})",
         listener.local_addr()?,
         capacity
     );
@@ -154,15 +154,17 @@ fn main() -> io::Result<()> {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                debug!("Spawning handler thread");
                 let queue = queue.clone();
                 let stats = stats.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_control(stream, queue, stats) {
-                        warn!("session error: {}", e);
+                        warn!("Session error: '{}'", e);
                     }
+                    debug!("Handler thread done");
                 });
             }
-            Err(e) => warn!("control accept error: {}", e),
+            Err(e) => warn!("Control accept error: '{}'", e),
         }
     }
 
@@ -277,9 +279,15 @@ fn handle_control(
 
     // One thread per client worker.
     if role == ROLE_PRODUCER {
-        run_producer(&mut data, queue, stats)
+        debug!("Starting producer");
+        let x = run_producer(&mut data, queue, stats);
+        debug!("Stopping producer");
+        return x;
     } else {
-        run_consumer(&mut data, queue, stats)
+        debug!("Starting consumer");
+        let x = run_consumer(&mut data, queue, stats);
+        debug!("Stopping consumer");
+        return x;
     }
 }
 
@@ -327,6 +335,7 @@ fn run_consumer(
                 // dies mid-send.
                 stats.dropped_msgs.fetch_add(1, Ordering::Relaxed);
                 stats.dropped_bytes.fetch_add(len, Ordering::Relaxed);
+                queue.push(msg);
 
                 if matches!(
                     e.kind(),
@@ -334,8 +343,10 @@ fn run_consumer(
                         | io::ErrorKind::ConnectionReset
                         | io::ErrorKind::UnexpectedEof
                 ) {
+                    warn!("Write failed with: '{}'. Dropping client.", e);
                     return Ok(());
                 }
+                error!("Write failed with: '{}'. Dropping client.", e);
                 return Err(e);
             }
         }

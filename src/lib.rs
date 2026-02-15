@@ -13,6 +13,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 
 pub const ROLE_PRODUCER: u8 = b'P';
 pub const ROLE_CONSUMER: u8 = b'C';
+pub const ACK_PAYLOAD: u8   = b'A';
 
 pub const TOKEN_LEN: usize = 16;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
@@ -52,20 +53,36 @@ fn connect_data(
     Ok(s)
 }
 
-pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
+pub fn write_frame<S: Write + Read>(
+            s: &mut S,
+            payload: &[u8]
+        ) -> io::Result<()> {
     if payload.len() > MAX_FRAME_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "Frame too large")
+        );
     }
+
+    // Send frame data
     let len = payload.len() as u32;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(payload)?;
+    s.write_all(&len.to_be_bytes())?;
+    s.write_all(payload)?;
+    // Read acknowledgement
+    let mut ack_byte = [0u8; 1];
+    s.read_exact(&mut ack_byte)?; // Reads exactly 1 byte (should be b'A')
+    if ack_byte[0] != ACK_PAYLOAD {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "Invalid ACK bit")
+        );
+    }
+
     Ok(())
 }
 
 /// Returns `Ok(None)` on clean EOF (peer closed).
-pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
+pub fn read_frame<S: Read + Write>(s: &mut S) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf) {
+    match s.read_exact(&mut len_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
@@ -80,8 +97,12 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
         );
     }
 
+    // Read data
     let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload)?;
+    s.read_exact(&mut payload)?;
+    // Send acknowledgement
+    s.write_all(&[ACK_PAYLOAD])?;
+
     Ok(Some(payload))
 }
 
