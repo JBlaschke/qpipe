@@ -268,7 +268,7 @@ fn handle_control(
         match s.read_exact(&mut got) {
             Ok(()) if got == token => {
                 s.set_read_timeout(None).ok();
-                info!(
+                debug!(
                     "client {} authenticated on ephemeral port {}", peer, port
                 );
                 break s;
