@@ -1,0 +1,3 @@
+# Keep Cargo's vendored crates byte-for-byte identical across OSes.
+# This prevents CRLF/LF conversions that break Cargo's checksum verification.
+vendor/** -text
