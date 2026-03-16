@@ -1,0 +1,228 @@
+name: Build & attach Rust binaries (multi-platform)
+
+on:
+  push:
+    tags:
+      - "v*"
+      # If you want *any* tag to trigger, replace the above with:
+      # - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # -------------------------
+          # Linux (glibc baseline 2.32) - uses zigbuild
+          # Produces artifacts that should run on systems with glibc >= 2.32
+          # -------------------------
+          - runs_on: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-gnu.2.32
+            asset_target: x86_64-unknown-linux-gnu.2.32
+            builder: zigbuild
+            archive_ext: tar.gz
+
+          - runs_on: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            build_target: aarch64-unknown-linux-gnu.2.32
+            asset_target: aarch64-unknown-linux-gnu.2.32
+            builder: zigbuild
+            archive_ext: tar.gz
+
+          - runs_on: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-gnu.2.43
+            asset_target: x86_64-unknown-linux-gnu.2.43
+            builder: zigbuild
+            archive_ext: tar.gz
+
+          - runs_on: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            build_target: aarch64-unknown-linux-gnu.2.43
+            asset_target: aarch64-unknown-linux-gnu.2.43
+            builder: zigbuild
+            archive_ext: tar.gz
+
+          # -------------------------
+          # Linux (musl) - uses zigbuild
+          # Often fully static; avoids glibc compatibility issues entirely
+          # -------------------------
+          - runs_on: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            build_target: x86_64-unknown-linux-musl
+            asset_target: x86_64-unknown-linux-musl
+            builder: zigbuild
+            archive_ext: tar.gz
+
+          - runs_on: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            build_target: aarch64-unknown-linux-musl
+            asset_target: aarch64-unknown-linux-musl
+            builder: zigbuild
+            archive_ext: tar.gz
+
+          # -------------------------
+          # FreeBSD (built inside VM) - tar.gz
+          # Build on FreeBSD 13.x to avoid FBSD_1.7 (FreeBSD 14 ABI).
+          # -------------------------
+          - runs_on: ubuntu-24.04
+            builder: freebsd-vm
+            freebsd_release: "13.5"
+            freebsd_arch: x86_64
+            rust_target: x86_64-unknown-freebsd
+            build_target: x86_64-unknown-freebsd
+            asset_target: x86_64-unknown-freebsd13.5
+            archive_ext: tar.gz
+
+          - runs_on: ubuntu-24.04
+            builder: freebsd-vm
+            freebsd_release: "13.5"
+            freebsd_arch: aarch64
+            rust_target: aarch64-unknown-freebsd
+            build_target: aarch64-unknown-freebsd
+            asset_target: aarch64-unknown-freebsd13.5
+            archive_ext: tar.gz
+
+          # -------------------------
+          # Windows (native cargo build)
+          # -------------------------
+          - runs_on: windows-2022
+            rust_target: x86_64-pc-windows-msvc
+            build_target: x86_64-pc-windows-msvc
+            asset_target: x86_64-pc-windows-msvc
+            builder: cargo
+            archive_ext: zip
+
+          - runs_on: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            build_target: aarch64-pc-windows-msvc
+            asset_target: aarch64-pc-windows-msvc
+            builder: cargo
+            archive_ext: zip
+
+          # -------------------------
+          # macOS (native cargo build)
+          # -------------------------
+          - runs_on: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            build_target: x86_64-apple-darwin
+            asset_target: x86_64-apple-darwin
+            builder: cargo
+            archive_ext: tar.gz
+
+          - runs_on: macos-15
+            rust_target: aarch64-apple-darwin
+            build_target: aarch64-apple-darwin
+            asset_target: aarch64-apple-darwin
+            builder: cargo
+            archive_ext: tar.gz
+
+    runs-on: ${{ matrix.runs_on }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python (for packaging)
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Rust (stable, with targets)
+        if: matrix.builder != 'freebsd-vm'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install Rust (stable, host-only for FreeBSD packaging)
+        if: matrix.builder == 'freebsd-vm'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        if: matrix.builder != 'freebsd-vm'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.asset_target }}
+
+      - name: Install Zig
+        if: matrix.builder == 'zigbuild'
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        if: matrix.builder == 'zigbuild'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build (release, cargo)
+        if: matrix.builder == 'cargo'
+        run: cargo build --release --offline --bins --target ${{ matrix.build_target }}
+
+      - name: Build (release, zigbuild)
+        if: matrix.builder == 'zigbuild'
+        run: cargo zigbuild --release --offline --bins --target ${{ matrix.build_target }}
+
+      - name: Build (release, FreeBSD VM)
+        if: matrix.builder == 'freebsd-vm'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.freebsd_release }}
+          arch: ${{ matrix.freebsd_arch }}
+          usesh: true
+          prepare: |
+            pkg update -f
+            pkg install -y rust
+          run: |
+            set -eu
+            cd "$GITHUB_WORKSPACE"
+
+            echo "FreeBSD:"; freebsd-version || true
+            rustc -V
+            cargo -V
+
+            cargo build --release --offline --bins --target ${{ matrix.build_target }}
+
+      - name: Package archive (all binaries)
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.build_target }}
+          ASSET_TARGET: ${{ matrix.asset_target }}
+          TAG: ${{ github.ref_name }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          # Optional override (repo variable): "parallel-tar parallel-idx view-idx"
+          BIN_NAMES: ${{ vars.BIN_NAMES }}
+        run: python .github/scripts/package_release.py
+
+      - name: Upload artifact (for release job)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_target }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  release:
+    name: Attach artifacts to GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
