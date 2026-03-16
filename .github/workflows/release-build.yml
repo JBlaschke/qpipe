@@ -126,11 +126,6 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
 
     steps:
-      - name: Configure git for Windows
-        run: |
-          git config --global core.autocrlf false
-          git config --global core.longpaths true
-
       - uses: actions/checkout@v6
 
       - name: Setup Python (for packaging)
