@@ -133,13 +133,18 @@ fn main() -> io::Result<()> {
 
     let queue = Arc::new(SharedQueue::new(capacity));
     let stats = Arc::new(Stats::default());
+    
+    let sfreq = env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     // Reporter thread: emits a one-line summary every second.
     {
         let stats = stats.clone();
         let queue = queue.clone();
         thread::spawn(
-            move || stats_reporter(stats, queue, Duration::from_secs(1))
+            move || stats_reporter(stats, queue, Duration::from_secs(sfreq))
         );
     }
 
