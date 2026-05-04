@@ -9,3 +9,7 @@ base64 = "0.22.1"
 env_logger = "0.11.9"
 log = "0.4.29"
 rand = "0.10.0"
+
+rmp-serde = "1"          # for typed Rust structs
+rmpv      = "1"          # for schema-less Value, useful in CLI tools
+serde     = { version = "1", features = ["derive"] }

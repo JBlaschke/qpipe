@@ -16,6 +16,12 @@ enum Mode {
     Jsonl,
     /// One base64-encoded line per message on stdout.
     Base64,
+    /// Write payload bytes verbatim, no encoding and no framing.
+    /// Pairs naturally with self-delimiting binary formats like
+    /// MessagePack: producers send msgpack-encoded payloads, then
+    ///   consumer ADDR --raw | from msgpack --objects
+    /// streams typed records into Nushell.
+    Raw,
 }
 
 impl Mode {
@@ -24,9 +30,10 @@ impl Mode {
             "--log"    => Ok(Mode::Log),
             "--jsonl"  => Ok(Mode::Jsonl),
             "--base64" => Ok(Mode::Base64),
+            "--raw"    => Ok(Mode::Raw),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("mode must be --log, --jsonl, or --base64 (got {s:?})"),
+                format!("mode must be --log, --jsonl, --base64, or --raw (got {s:?})"),
             )),
         }
     }
@@ -108,6 +115,13 @@ fn main() -> io::Result<()> {
                 let line = STANDARD.encode(&msg);
                 out.write_all(line.as_bytes())?;
                 out.write_all(b"\n")?;
+                out.flush()?;
+            }
+            Mode::Raw => {
+                // No encoding, no newline. Assumes the payload is itself
+                // self-delimiting (e.g. MessagePack) so the downstream
+                // decoder can frame the stream.
+                out.write_all(&msg)?;
                 out.flush()?;
             }
         }
