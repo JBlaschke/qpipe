@@ -10,13 +10,75 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::thread;
+use std::time::{Duration, Instant};
 
-pub const ROLE_PRODUCER: u8 = b'P';
-pub const ROLE_CONSUMER: u8 = b'C';
-pub const ACK_PAYLOAD: u8   = b'A';
+pub const ROLE_PRODUCER: u8    = b'P';
+pub const ROLE_CONSUMER: u8    = b'C';
+pub const ROLE_HEALTHCHECK: u8 = b'H';
+pub const ACK_PAYLOAD: u8      = b'A';
+pub const ACK_HEALTH: u8       = b'H';
 
 pub const TOKEN_LEN: usize = 16;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Single-shot health probe. Opens a control connection, sends the
+/// healthcheck role byte, and waits for the orchestrator's ack. Succeeds
+/// only when the orchestrator is alive and processing role bytes — not
+/// just that the TCP listener accepted the socket.
+pub fn healthcheck(orchestrator: &str) -> io::Result<()> {
+    let addr = resolve_first(orchestrator)?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    s.set_nodelay(true).ok();
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    s.write_all(&[ROLE_HEALTHCHECK])?;
+    s.flush()?;
+
+    let mut ack = [0u8; 1];
+    s.read_exact(&mut ack)?;
+    if ack[0] != ACK_HEALTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected healthcheck ack: 0x{:02x}", ack[0]),
+        ));
+    }
+    Ok(())
+}
+
+/// Blocks until the orchestrator passes a healthcheck, or the optional
+/// timeout elapses. Retries with capped exponential backoff (100ms → 2s).
+/// Pass `None` to wait forever.
+pub fn wait_until_healthy(
+            orchestrator: &str,
+            timeout: Option<Duration>,
+        ) -> io::Result<()> {
+    let start = Instant::now();
+    let mut delay = Duration::from_millis(100);
+    let max_delay = Duration::from_secs(2);
+
+    loop {
+        match healthcheck(orchestrator) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if let Some(t) = timeout {
+                    if start.elapsed() >= t {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "orchestrator at {} not healthy within {:?}: {}",
+                                orchestrator, t, e
+                            ),
+                        ));
+                    }
+                }
+                thread::sleep(delay);
+                delay = (delay * 2).min(max_delay);
+            }
+        }
+    }
+}
 
 fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
     addr.to_socket_addrs()?

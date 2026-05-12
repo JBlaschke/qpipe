@@ -12,7 +12,10 @@ use rand::{rngs::SysRng, TryRng};
 
 use log::{debug, info, warn, error};
 
-use qpipe::{read_frame, write_frame, ROLE_CONSUMER, ROLE_PRODUCER, TOKEN_LEN};
+use qpipe::{
+    read_frame, write_frame, ACK_HEALTH,
+    ROLE_CONSUMER, ROLE_HEALTHCHECK, ROLE_PRODUCER, TOKEN_LEN,
+};
 
 #[derive(Default)]
 struct Stats {
@@ -218,9 +221,9 @@ fn stats_reporter(
 
         // One compact line per interval; goes to stderr.
         info!(
-            "[stats] +{dm_posted} msg/s ({db_posted} B/s) posted | \
-             +{dm_collected} msg/s ({db_collected} B/s) collected | \
-             +{dm_dropped} msg/s ({db_dropped} B/s) dropped | \
+            "[stats] +{dm_posted} msgs ({db_posted} B) posted | \
+             +{dm_collected} msgs ({db_collected} B) collected | \
+             +{dm_dropped} msgs ({db_dropped} B) dropped | \
              in_queue={qd} | producers={prod} consumers={cons} | totals: posted={posted_msgs} collected={collected_msgs} dropped={dropped_msgs}"
         );
     }
@@ -237,6 +240,14 @@ fn handle_control(
     let mut role = [0u8; 1];
     ctrl.read_exact(&mut role)?;
     let role = role[0];
+
+    // Healthcheck: ack and close. No ephemeral port, no queue interaction, no
+    // ConnGuard — healthchecks don't show up in active_{producers,consumers}.
+    if role == ROLE_HEALTHCHECK {
+        ctrl.write_all(&[ACK_HEALTH])?;
+        ctrl.flush()?;
+        return Ok(());
+    }
 
     if role != ROLE_PRODUCER && role != ROLE_CONSUMER {
         return Err(
