@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 pub const ROLE_PRODUCER: u8    = b'P';
 pub const ROLE_CONSUMER: u8    = b'C';
 pub const ROLE_HEALTHCHECK: u8 = b'H';
+pub const ROLE_SHUTDOWN: u8    = b'S';
 pub const ACK_PAYLOAD: u8      = b'A';
 pub const ACK_HEALTH: u8       = b'H';
+pub const ACK_SHUTDOWN:  u8    = b'S';
 
 pub const TOKEN_LEN: usize = 16;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
@@ -78,6 +80,37 @@ pub fn wait_until_healthy(
             }
         }
     }
+}
+
+
+/// Request that an orchestrator shut down gracefully. Returns `Ok(())` when
+/// the orchestrator acknowledged the request — *not* when shutdown is
+/// complete. The orchestrator will drain its queue and exit on its own
+/// schedule after acking.
+///
+/// Failure modes (any return `Err`):
+///   - connect refused / timed out
+///   - orchestrator closed the socket without acking
+///   - ack byte was something other than `ACK_SHUTDOWN`
+pub fn request_shutdown(orchestrator: &str) -> io::Result<()> {
+    let addr = resolve_first(orchestrator)?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    s.set_nodelay(true).ok();
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    s.write_all(&[ROLE_SHUTDOWN])?;
+    s.flush()?;
+
+    let mut ack = [0u8; 1];
+    s.read_exact(&mut ack)?;
+    if ack[0] != ACK_SHUTDOWN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected shutdown ack: 0x{:02x}", ack[0]),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_first(addr: &str) -> io::Result<SocketAddr> {

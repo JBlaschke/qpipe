@@ -3,46 +3,47 @@ use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::{rngs::SysRng, TryRng};
 
 use log::{debug, info, warn, error};
 
 use qpipe::{
-    read_frame, write_frame, ACK_HEALTH,
-    ROLE_CONSUMER, ROLE_HEALTHCHECK, ROLE_PRODUCER, TOKEN_LEN,
+    read_frame, request_shutdown, write_frame,
+    ACK_HEALTH, ACK_SHUTDOWN,
+    ROLE_CONSUMER, ROLE_HEALTHCHECK, ROLE_PRODUCER, ROLE_SHUTDOWN,
+    TOKEN_LEN,
 };
+
+// How long to wait for queue drain after a shutdown is requested before
+// giving up and exiting anyway. Tunable via QPIPE_DRAIN_TIMEOUT_SECS.
+const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Default)]
 struct Stats {
     // Messages accepted from producers and enqueued
-    posted_msgs: AtomicU64,
-    posted_bytes: AtomicU64,
-
+    posted_msgs:      AtomicU64,
+    posted_bytes:     AtomicU64,
     // Messages successfully written to consumer sockets
-    collected_msgs: AtomicU64,
-    collected_bytes: AtomicU64,
-
+    collected_msgs:   AtomicU64,
+    collected_bytes:  AtomicU64,
     // Messages popped but NOT delivered because consumer write failed
-    dropped_msgs: AtomicU64,
-    dropped_bytes: AtomicU64,
-
+    dropped_msgs:     AtomicU64,
+    dropped_bytes:    AtomicU64,
     // Connection counts
     active_producers: AtomicUsize,
     active_consumers: AtomicUsize,
 }
 
-enum ConnKind {
-    Producer,
-    Consumer,
-}
+enum ConnKind { Producer, Consumer }
 
 struct ConnGuard {
-    kind: ConnKind,
+    kind:  ConnKind,
     stats: Arc<Stats>,
 }
 
@@ -74,13 +75,11 @@ impl Drop for ConnGuard {
 }
 
 struct SharedQueue {
-    inner: Mutex<VecDeque<Vec<u8>>>,
+    inner:     Mutex<VecDeque<Vec<u8>>>,
     not_empty: Condvar,
-    not_full: Condvar,
-    capacity: usize,
-
-    // Exact queue depth maintained under the same lock used by push/pop.
-    depth: AtomicUsize,
+    not_full:  Condvar,
+    capacity:  usize,
+    depth:     AtomicUsize,
 }
 
 impl SharedQueue {
@@ -88,7 +87,7 @@ impl SharedQueue {
         Self {
             inner: Mutex::new(VecDeque::new()),
             not_empty: Condvar::new(),
-            not_full: Condvar::new(),
+            not_full:  Condvar::new(),
             capacity,
             depth: AtomicUsize::new(0),
         }
@@ -120,106 +119,175 @@ impl SharedQueue {
     }
 }
 
-fn main() -> io::Result<()> {
-    // By default emit warnings
+fn main() -> ExitCode {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn")
     ).init();
 
-    let listen_addr = env::args()
-        .nth(1)
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // ── Shutdown client mode ────────────────────────────────────────────────
+    // Usage: orchestrator --shutdown [ADDR]
+    // Exit 0 iff the target orchestrator ack'd the request.
+    if args.first().map(String::as_str) == Some("--shutdown") {
+        let addr = args.get(1).cloned()
+            .unwrap_or_else(|| "127.0.0.1:7000".to_string());
+        return match request_shutdown(&addr) {
+            Ok(()) => {
+                info!("shutdown acknowledged by {}", addr);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("shutdown request to {} failed: {}", addr, e);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // ── Server mode ─────────────────────────────────────────────────────────
+    match run_server(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            error!("orchestrator failed: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_server(args: &[String]) -> io::Result<()> {
+    let listen_addr = args.first().cloned()
         .unwrap_or_else(|| "0.0.0.0:7000".to_string());
-    let capacity: usize = env::args()
-        .nth(2)
+    let capacity: usize = args.get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
-
-    let queue = Arc::new(SharedQueue::new(capacity));
-    let stats = Arc::new(Stats::default());
-    
-    let sfreq = env::args()
-        .nth(3)
+    let sfreq: u64 = args.get(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    // Reporter thread: emits a one-line summary every second.
+    let queue    = Arc::new(SharedQueue::new(capacity));
+    let stats    = Arc::new(Stats::default());
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Reporter thread.
     {
         let stats = stats.clone();
         let queue = queue.clone();
+        let shutdown = shutdown.clone();
         thread::spawn(
-            move || stats_reporter(stats, queue, Duration::from_secs(sfreq))
+            move || stats_reporter(stats, queue, shutdown, Duration::from_secs(sfreq))
         );
     }
 
     let listener = TcpListener::bind(&listen_addr)?;
+    // Nonblocking so we can periodically check the shutdown flag and break
+    // out of the accept loop without needing a self-pipe wakeup.
+    listener.set_nonblocking(true)?;
+
     info!(
         "Orchestrator control listening on {} (queue capacity {})",
-        listener.local_addr()?,
-        capacity
+        listener.local_addr()?, capacity
     );
 
-    // One accept loop; one thread per client session.
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
+    // ── Accept loop ─────────────────────────────────────────────────────────
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
                 debug!("Spawning handler thread");
                 let queue = queue.clone();
                 let stats = stats.clone();
+                let shutdown = shutdown.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_control(stream, queue, stats) {
+                    if let Err(e) = handle_control(stream, queue, stats, shutdown) {
                         warn!("Session error: '{}'", e);
                     }
                     debug!("Handler thread done");
                 });
             }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
             Err(e) => warn!("Control accept error: '{}'", e),
         }
     }
 
-    Ok(())
+    // ── Drain phase ─────────────────────────────────────────────────────────
+    // Listener has been dropped (well, will be when this function returns) —
+    // no new sessions accepted. Wait for the queue to drain and existing
+    // producers to finish, up to a timeout.
+    info!("shutdown requested; entering drain phase");
+    let drain_timeout = env::var("QPIPE_DRAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS));
+
+    let drain_start = Instant::now();
+    loop {
+        let depth     = queue.depth();
+        let producers = stats.active_producers.load(Ordering::Relaxed);
+        let consumers = stats.active_consumers.load(Ordering::Relaxed);
+
+        if depth == 0 && producers == 0 {
+            info!(
+                "drained cleanly in {:?} (consumers still attached: {})",
+                drain_start.elapsed(), consumers
+            );
+            return Ok(());
+        }
+
+        if drain_start.elapsed() >= drain_timeout {
+            warn!(
+                "drain timeout after {:?}: depth={}, active_producers={}, active_consumers={}; exiting",
+                drain_timeout, depth, producers, consumers
+            );
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn stats_reporter(
-            stats: Arc<Stats>,
-            queue: Arc<SharedQueue>,
-            every: Duration
+            stats:    Arc<Stats>,
+            queue:    Arc<SharedQueue>,
+            shutdown: Arc<AtomicBool>,
+            every:    Duration,
         ) {
-    let mut last_posted_msgs = 0u64;
-    let mut last_posted_bytes = 0u64;
-    let mut last_collected_msgs = 0u64;
+    let mut last_posted_msgs     = 0u64;
+    let mut last_posted_bytes    = 0u64;
+    let mut last_collected_msgs  = 0u64;
     let mut last_collected_bytes = 0u64;
-    let mut last_dropped_msgs = 0u64;
-    let mut last_dropped_bytes = 0u64;
+    let mut last_dropped_msgs    = 0u64;
+    let mut last_dropped_bytes   = 0u64;
 
-    loop {
+    while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(every);
 
-        let posted_msgs = stats.posted_msgs.load(Ordering::Relaxed);
-        let posted_bytes = stats.posted_bytes.load(Ordering::Relaxed);
-        let collected_msgs = stats.collected_msgs.load(Ordering::Relaxed);
+        let posted_msgs     = stats.posted_msgs.load(Ordering::Relaxed);
+        let posted_bytes    = stats.posted_bytes.load(Ordering::Relaxed);
+        let collected_msgs  = stats.collected_msgs.load(Ordering::Relaxed);
         let collected_bytes = stats.collected_bytes.load(Ordering::Relaxed);
-        let dropped_msgs = stats.dropped_msgs.load(Ordering::Relaxed);
-        let dropped_bytes = stats.dropped_bytes.load(Ordering::Relaxed);
+        let dropped_msgs    = stats.dropped_msgs.load(Ordering::Relaxed);
+        let dropped_bytes   = stats.dropped_bytes.load(Ordering::Relaxed);
 
-        let dm_posted = posted_msgs - last_posted_msgs;
-        let db_posted = posted_bytes - last_posted_bytes;
+        let dm_posted    = posted_msgs - last_posted_msgs;
+        let db_posted    = posted_bytes - last_posted_bytes;
         let dm_collected = collected_msgs - last_collected_msgs;
         let db_collected = collected_bytes - last_collected_bytes;
-        let dm_dropped = dropped_msgs - last_dropped_msgs;
-        let db_dropped = dropped_bytes - last_dropped_bytes;
+        let dm_dropped   = dropped_msgs - last_dropped_msgs;
+        let db_dropped   = dropped_bytes - last_dropped_bytes;
 
-        last_posted_msgs = posted_msgs;
-        last_posted_bytes = posted_bytes;
-        last_collected_msgs = collected_msgs;
+        last_posted_msgs     = posted_msgs;
+        last_posted_bytes    = posted_bytes;
+        last_collected_msgs  = collected_msgs;
         last_collected_bytes = collected_bytes;
-        last_dropped_msgs = dropped_msgs;
-        last_dropped_bytes = dropped_bytes;
+        last_dropped_msgs    = dropped_msgs;
+        last_dropped_bytes   = dropped_bytes;
 
-        let qd = queue.depth();
+        let qd   = queue.depth();
         let prod = stats.active_producers.load(Ordering::Relaxed);
         let cons = stats.active_consumers.load(Ordering::Relaxed);
 
-        // One compact line per interval; goes to stderr.
         info!(
             "[stats] +{dm_posted} msgs ({db_posted} B) posted | \
              +{dm_collected} msgs ({db_collected} B) collected | \
@@ -231,21 +299,34 @@ fn stats_reporter(
 
 fn handle_control(
             mut ctrl: TcpStream,
-            queue: Arc<SharedQueue>,
-            stats: Arc<Stats>
+            queue:    Arc<SharedQueue>,
+            stats:    Arc<Stats>,
+            shutdown: Arc<AtomicBool>,
         ) -> io::Result<()> {
     ctrl.set_nodelay(true).ok();
 
-    // Read role byte.
     let mut role = [0u8; 1];
     ctrl.read_exact(&mut role)?;
     let role = role[0];
 
-    // Healthcheck: ack and close. No ephemeral port, no queue interaction, no
-    // ConnGuard — healthchecks don't show up in active_{producers,consumers}.
+    // Healthcheck: ack and close. No ephemeral port, no queue interaction.
     if role == ROLE_HEALTHCHECK {
         ctrl.write_all(&[ACK_HEALTH])?;
         ctrl.flush()?;
+        return Ok(());
+    }
+
+    // Shutdown: ack immediately, then set the flag. The main loop will see
+    // the flag, stop accepting, and drain. Acking before flipping the flag
+    // matters because we want the caller to know its request was received
+    // regardless of how long the drain takes.
+    if role == ROLE_SHUTDOWN {
+        let peer = ctrl.peer_addr().ok().map(|a| a.to_string())
+            .unwrap_or_else(|| "<unknown>".into());
+        info!("shutdown requested by {}", peer);
+        ctrl.write_all(&[ACK_SHUTDOWN])?;
+        ctrl.flush()?;
+        shutdown.store(true, Ordering::SeqCst);
         return Ok(());
     }
 
@@ -255,26 +336,20 @@ fn handle_control(
         );
     }
 
-    // Bind ephemeral port on same IP family as the control socket.
     let bind_ip = ctrl.local_addr()?.ip();
     let data_listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))?;
     let port = data_listener.local_addr()?.port();
 
-    // Session token to prevent accidental/hijacked connects to the ephemeral
-    // port.
     let mut token = [0u8; TOKEN_LEN];
-    //OsRng.fill_bytes(&mut token);
     SysRng.try_fill_bytes(&mut token).map_err(
         |e| io::Error::new(io::ErrorKind::Other, e)
     )?;
 
-    // Reply to control session: [u16 port][TOKEN_LEN token]
     ctrl.write_all(&port.to_be_bytes())?;
     ctrl.write_all(&token)?;
     ctrl.flush()?;
     drop(ctrl);
 
-    // Accept until a client presents the correct token.
     let mut data = loop {
         let (mut s, peer) = data_listener.accept()?;
         s.set_nodelay(true).ok();
@@ -284,33 +359,30 @@ fn handle_control(
         match s.read_exact(&mut got) {
             Ok(()) if got == token => {
                 s.set_read_timeout(None).ok();
-                debug!(
-                    "client {} authenticated on ephemeral port {}", peer, port
-                );
+                debug!("client {} authenticated on ephemeral port {}", peer, port);
                 break s;
             }
             _ => continue,
         }
     };
 
-    // One thread per client worker.
     if role == ROLE_PRODUCER {
         debug!("Starting producer");
         let x = run_producer(&mut data, queue, stats);
         debug!("Stopping producer");
-        return x;
+        x
     } else {
         debug!("Starting consumer");
         let x = run_consumer(&mut data, queue, stats);
         debug!("Stopping consumer");
-        return x;
+        x
     }
 }
 
 fn run_producer(
             stream: &mut TcpStream,
-            queue: Arc<SharedQueue>,
-            stats: Arc<Stats>
+            queue:  Arc<SharedQueue>,
+            stats:  Arc<Stats>,
         ) -> io::Result<()> {
     let _guard = ConnGuard::new(ConnKind::Producer, stats.clone());
 
@@ -322,15 +394,15 @@ fn run_producer(
                 stats.posted_msgs.fetch_add(1, Ordering::Relaxed);
                 stats.posted_bytes.fetch_add(len, Ordering::Relaxed);
             }
-            None => return Ok(()), // producer disconnected
+            None => return Ok(()),
         }
     }
 }
 
 fn run_consumer(
             stream: &mut TcpStream,
-            queue: Arc<SharedQueue>,
-            stats: Arc<Stats>
+            queue:  Arc<SharedQueue>,
+            stats:  Arc<Stats>,
         ) -> io::Result<()> {
     let _guard = ConnGuard::new(ConnKind::Consumer, stats.clone());
 
@@ -340,15 +412,11 @@ fn run_consumer(
 
         match write_frame(stream, &msg) {
             Ok(()) => {
-                // “Collected” here means “successfully written to the consumer
-                // socket.”
                 stats.collected_msgs.fetch_add(1, Ordering::Relaxed);
                 stats.collected_bytes.fetch_add(len, Ordering::Relaxed);
                 stream.flush().ok();
             }
             Err(e) => {
-                // At-most-once semantics: popped message is dropped if consumer
-                // dies mid-send.
                 stats.dropped_msgs.fetch_add(1, Ordering::Relaxed);
                 stats.dropped_bytes.fetch_add(len, Ordering::Relaxed);
                 queue.push(msg);
