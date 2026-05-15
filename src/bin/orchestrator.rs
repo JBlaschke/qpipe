@@ -4,7 +4,7 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,11 +14,17 @@ use rand::{rngs::SysRng, TryRng};
 use log::{debug, info, warn, error};
 
 use qpipe::{
-    read_frame, request_shutdown, write_frame,
-    ACK_HEALTH, ACK_SHUTDOWN,
-    ROLE_CONSUMER, ROLE_HEALTHCHECK, ROLE_PRODUCER, ROLE_SHUTDOWN,
+    read_frame, request_drain, request_shutdown, write_frame,
+    ACK_DRAIN, ACK_HEALTH, ACK_SHUTDOWN,
+    ROLE_CONSUMER, ROLE_DRAIN, ROLE_HEALTHCHECK, ROLE_PRODUCER, ROLE_SHUTDOWN,
     TOKEN_LEN,
 };
+
+// Orchestrator lifecycle state. The accept loop runs only while RUNNING;
+// any other state stops new sessions and enters the drain phase.
+const STATE_RUNNING:       u8 = 0;
+const STATE_DRAINING:      u8 = 1; // wait forever for queue + producers
+const STATE_SHUTTING_DOWN: u8 = 2; // wait with timeout, then exit anyway
 
 // How long to wait for queue drain after a shutdown is requested before
 // giving up and exiting anyway. Tunable via QPIPE_DRAIN_TIMEOUT_SECS.
@@ -126,22 +132,37 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = env::args().skip(1).collect();
 
-    // ── Shutdown client mode ────────────────────────────────────────────────
-    // Usage: orchestrator --shutdown [ADDR]
-    // Exit 0 iff the target orchestrator ack'd the request.
-    if args.first().map(String::as_str) == Some("--shutdown") {
-        let addr = args.get(1).cloned()
-            .unwrap_or_else(|| "127.0.0.1:7000".to_string());
-        return match request_shutdown(&addr) {
-            Ok(()) => {
-                info!("shutdown acknowledged by {}", addr);
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("shutdown request to {} failed: {}", addr, e);
-                ExitCode::FAILURE
-            }
-        };
+    // ── Client modes ────────────────────────────────────────────────────────
+    match args.first().map(String::as_str) {
+        Some("--shutdown") => {
+            let addr = args.get(1).cloned()
+                .unwrap_or_else(|| "127.0.0.1:7000".to_string());
+            return match request_shutdown(&addr) {
+                Ok(()) => {
+                    info!("shutdown acknowledged by {}", addr);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("shutdown request to {} failed: {}", addr, e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some("--drain") => {
+            let addr = args.get(1).cloned()
+                .unwrap_or_else(|| "127.0.0.1:7000".to_string());
+            return match request_drain(&addr) {
+                Ok(()) => {
+                    info!("drain acknowledged by {}", addr);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("drain request to {} failed: {}", addr, e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        _ => {}
     }
 
     // ── Server mode ─────────────────────────────────────────────────────────
@@ -164,23 +185,21 @@ fn run_server(args: &[String]) -> io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    let queue    = Arc::new(SharedQueue::new(capacity));
-    let stats    = Arc::new(Stats::default());
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let queue = Arc::new(SharedQueue::new(capacity));
+    let stats = Arc::new(Stats::default());
+    let state = Arc::new(AtomicU8::new(STATE_RUNNING));
 
     // Reporter thread.
     {
         let stats = stats.clone();
         let queue = queue.clone();
-        let shutdown = shutdown.clone();
+        let state = state.clone();
         thread::spawn(
-            move || stats_reporter(stats, queue, shutdown, Duration::from_secs(sfreq))
+            move || stats_reporter(stats, queue, state, Duration::from_secs(sfreq))
         );
     }
 
     let listener = TcpListener::bind(&listen_addr)?;
-    // Nonblocking so we can periodically check the shutdown flag and break
-    // out of the accept loop without needing a self-pipe wakeup.
     listener.set_nonblocking(true)?;
 
     info!(
@@ -189,15 +208,15 @@ fn run_server(args: &[String]) -> io::Result<()> {
     );
 
     // ── Accept loop ─────────────────────────────────────────────────────────
-    while !shutdown.load(Ordering::SeqCst) {
+    while state.load(Ordering::SeqCst) == STATE_RUNNING {
         match listener.accept() {
             Ok((stream, _peer)) => {
                 debug!("Spawning handler thread");
                 let queue = queue.clone();
                 let stats = stats.clone();
-                let shutdown = shutdown.clone();
+                let state = state.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_control(stream, queue, stats, shutdown) {
+                    if let Err(e) = handle_control(stream, queue, stats, state) {
                         warn!("Session error: '{}'", e);
                     }
                     debug!("Handler thread done");
@@ -211,22 +230,59 @@ fn run_server(args: &[String]) -> io::Result<()> {
     }
 
     // ── Drain phase ─────────────────────────────────────────────────────────
-    // Listener has been dropped (well, will be when this function returns) —
-    // no new sessions accepted. Wait for the queue to drain and existing
-    // producers to finish, up to a timeout.
-    info!("shutdown requested; entering drain phase");
+    drain(queue, stats, state)
+}
+
+fn drain(
+            queue: Arc<SharedQueue>,
+            stats: Arc<Stats>,
+            state: Arc<AtomicU8>,
+        ) -> io::Result<()> {
+    let initial_state = state.load(Ordering::SeqCst);
     let drain_timeout = env::var("QPIPE_DRAIN_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS));
 
+    match initial_state {
+        STATE_DRAINING => {
+            info!("entering DRAIN state — no timeout, waiting for queue to empty");
+        }
+        STATE_SHUTTING_DOWN => {
+            info!(
+                "entering SHUTDOWN state — drain timeout {:?}",
+                drain_timeout
+            );
+        }
+        _ => {} // unreachable but harmless
+    }
+
     let drain_start = Instant::now();
+    // Set the first time we observe STATE_SHUTTING_DOWN; the timeout is
+    // measured from that point. For a pure shutdown this is the very first
+    // iteration; for drain-then-shutdown it's whenever the upgrade happens.
+    let mut shutdown_at: Option<Instant> = None;
+    let mut last_progress_log = Instant::now();
+
     loop {
+        let st        = state.load(Ordering::SeqCst);
         let depth     = queue.depth();
         let producers = stats.active_producers.load(Ordering::Relaxed);
         let consumers = stats.active_consumers.load(Ordering::Relaxed);
 
+        // Detect drain → shutdown transition; start the timeout clock.
+        if st == STATE_SHUTTING_DOWN && shutdown_at.is_none() {
+            shutdown_at = Some(Instant::now());
+            if initial_state == STATE_DRAINING {
+                info!(
+                    "drain upgraded to shutdown; timeout {:?} from now",
+                    drain_timeout
+                );
+            }
+        }
+
+        // Clean exit: nothing buffered, no producers still feeding.
         if depth == 0 && producers == 0 {
             info!(
                 "drained cleanly in {:?} (consumers still attached: {})",
@@ -235,12 +291,25 @@ fn run_server(args: &[String]) -> io::Result<()> {
             return Ok(());
         }
 
-        if drain_start.elapsed() >= drain_timeout {
-            warn!(
-                "drain timeout after {:?}: depth={}, active_producers={}, active_consumers={}; exiting",
-                drain_timeout, depth, producers, consumers
+        // Timeout only applies when shutdown was requested (now or earlier).
+        if let Some(t0) = shutdown_at {
+            if t0.elapsed() >= drain_timeout {
+                warn!(
+                    "drain timeout after {:?}: depth={}, active_producers={}, active_consumers={}; exiting",
+                    drain_timeout, depth, producers, consumers
+                );
+                return Ok(());
+            }
+        }
+
+        // Periodic progress line so the log reflects ongoing drain state.
+        if last_progress_log.elapsed() >= Duration::from_secs(5) {
+            let label = if st == STATE_DRAINING { "draining" } else { "shutting down" };
+            info!(
+                "{}: in_queue={}, active_producers={}, active_consumers={}, elapsed={:?}",
+                label, depth, producers, consumers, drain_start.elapsed()
             );
-            return Ok(());
+            last_progress_log = Instant::now();
         }
 
         thread::sleep(Duration::from_millis(200));
@@ -248,10 +317,10 @@ fn run_server(args: &[String]) -> io::Result<()> {
 }
 
 fn stats_reporter(
-            stats:    Arc<Stats>,
-            queue:    Arc<SharedQueue>,
-            shutdown: Arc<AtomicBool>,
-            every:    Duration,
+            stats: Arc<Stats>,
+            queue: Arc<SharedQueue>,
+            state: Arc<AtomicU8>,
+            every: Duration,
         ) {
     let mut last_posted_msgs     = 0u64;
     let mut last_posted_bytes    = 0u64;
@@ -260,7 +329,10 @@ fn stats_reporter(
     let mut last_dropped_msgs    = 0u64;
     let mut last_dropped_bytes   = 0u64;
 
-    while !shutdown.load(Ordering::Relaxed) {
+    // Run only while accepting traffic; stop once the orchestrator is
+    // draining or shutting down so the drain-phase log lines aren't
+    // interleaved with throughput noise.
+    while state.load(Ordering::Relaxed) == STATE_RUNNING {
         thread::sleep(every);
 
         let posted_msgs     = stats.posted_msgs.load(Ordering::Relaxed);
@@ -301,7 +373,7 @@ fn handle_control(
             mut ctrl: TcpStream,
             queue:    Arc<SharedQueue>,
             stats:    Arc<Stats>,
-            shutdown: Arc<AtomicBool>,
+            state:    Arc<AtomicU8>,
         ) -> io::Result<()> {
     ctrl.set_nodelay(true).ok();
 
@@ -309,24 +381,35 @@ fn handle_control(
     ctrl.read_exact(&mut role)?;
     let role = role[0];
 
-    // Healthcheck: ack and close. No ephemeral port, no queue interaction.
     if role == ROLE_HEALTHCHECK {
         ctrl.write_all(&[ACK_HEALTH])?;
         ctrl.flush()?;
         return Ok(());
     }
 
-    // Shutdown: ack immediately, then set the flag. The main loop will see
-    // the flag, stop accepting, and drain. Acking before flipping the flag
-    // matters because we want the caller to know its request was received
-    // regardless of how long the drain takes.
+    if role == ROLE_DRAIN {
+        let peer = ctrl.peer_addr().ok().map(|a| a.to_string())
+            .unwrap_or_else(|| "<unknown>".into());
+        info!("drain requested by {}", peer);
+        ctrl.write_all(&[ACK_DRAIN])?;
+        ctrl.flush()?;
+        // Enter drain only if currently running. Idempotent if already
+        // draining; doesn't downgrade from shutting-down.
+        let _ = state.compare_exchange(
+            STATE_RUNNING, STATE_DRAINING,
+            Ordering::SeqCst, Ordering::SeqCst
+        );
+        return Ok(());
+    }
+
     if role == ROLE_SHUTDOWN {
         let peer = ctrl.peer_addr().ok().map(|a| a.to_string())
             .unwrap_or_else(|| "<unknown>".into());
         info!("shutdown requested by {}", peer);
         ctrl.write_all(&[ACK_SHUTDOWN])?;
         ctrl.flush()?;
-        shutdown.store(true, Ordering::SeqCst);
+        // Shutdown overrides any prior state, including drain.
+        state.store(STATE_SHUTTING_DOWN, Ordering::SeqCst);
         return Ok(());
     }
 

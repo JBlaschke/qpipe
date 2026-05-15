@@ -16,10 +16,12 @@ use std::time::{Duration, Instant};
 pub const ROLE_PRODUCER: u8    = b'P';
 pub const ROLE_CONSUMER: u8    = b'C';
 pub const ROLE_HEALTHCHECK: u8 = b'H';
+pub const ROLE_DRAIN: u8       = b'D';
 pub const ROLE_SHUTDOWN: u8    = b'S';
 pub const ACK_PAYLOAD: u8      = b'A';
 pub const ACK_HEALTH: u8       = b'H';
-pub const ACK_SHUTDOWN:  u8    = b'S';
+pub const ACK_SHUTDOWN: u8     = b'S';
+pub const ACK_DRAIN: u8        = b'D';
 
 pub const TOKEN_LEN: usize = 16;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
@@ -82,6 +84,32 @@ pub fn wait_until_healthy(
     }
 }
 
+/// Request that an orchestrator enter the drain state. Returns `Ok(())`
+/// when the orchestrator acknowledges. Unlike `request_shutdown`, drain
+/// has no timeout on the server side — the orchestrator will wait for the
+/// queue to empty and producers to detach no matter how long it takes.
+/// A subsequent `request_shutdown` will override the drain and impose the
+/// usual timeout.
+pub fn request_drain(orchestrator: &str) -> io::Result<()> {
+    let addr = resolve_first(orchestrator)?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    s.set_nodelay(true).ok();
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    s.write_all(&[ROLE_DRAIN])?;
+    s.flush()?;
+
+    let mut ack = [0u8; 1];
+    s.read_exact(&mut ack)?;
+    if ack[0] != ACK_DRAIN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected drain ack: 0x{:02x}", ack[0]),
+        ));
+    }
+    Ok(())
+}
 
 /// Request that an orchestrator shut down gracefully. Returns `Ok(())` when
 /// the orchestrator acknowledged the request — *not* when shutdown is
