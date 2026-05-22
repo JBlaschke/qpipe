@@ -4,7 +4,7 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,8 +20,10 @@ use qpipe::{
     TOKEN_LEN,
 };
 
-// Orchestrator lifecycle state. The accept loop runs only while RUNNING;
-// any other state stops new sessions and enters the drain phase.
+// Orchestrator lifecycle state. New producer/consumer sessions are only
+// admitted while RUNNING; any other state stops admitting them but keeps
+// the control port open so admin commands (health/drain/shutdown) still
+// reach the orchestrator.
 const STATE_RUNNING:       u8 = 0;
 const STATE_DRAINING:      u8 = 1; // wait forever for queue + producers
 const STATE_SHUTTING_DOWN: u8 = 2; // wait with timeout, then exit anyway
@@ -188,6 +190,9 @@ fn run_server(args: &[String]) -> io::Result<()> {
     let queue = Arc::new(SharedQueue::new(capacity));
     let stats = Arc::new(Stats::default());
     let state = Arc::new(AtomicU8::new(STATE_RUNNING));
+    // Signals the accept loop to stop. Set after drain completes so any
+    // late admin commands are still served until the very last moment.
+    let exit  = Arc::new(AtomicBool::new(false));
 
     // Reporter thread.
     {
@@ -207,8 +212,42 @@ fn run_server(args: &[String]) -> io::Result<()> {
         listener.local_addr()?, capacity
     );
 
-    // ── Accept loop ─────────────────────────────────────────────────────────
+    // Accept loop runs in its own thread for the entire lifetime of the
+    // orchestrator. While the orchestrator is draining or shutting down it
+    // still admits admin requests (health/drain/shutdown) but rejects new
+    // producers and consumers — see handle_control.
+    let accept_handle = {
+        let queue = queue.clone();
+        let stats = stats.clone();
+        let state = state.clone();
+        let exit  = exit.clone();
+        thread::spawn(move || accept_loop(listener, queue, stats, state, exit))
+    };
+
+    // Block until something flips the state out of RUNNING.
     while state.load(Ordering::SeqCst) == STATE_RUNNING {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // ── Drain phase ─────────────────────────────────────────────────────────
+    // While we're in here the accept loop is still running, so a follow-up
+    // `--shutdown` can land and upgrade STATE_DRAINING → STATE_SHUTTING_DOWN.
+    let drain_result = drain(queue, stats, state);
+
+    // Stop accepting and join.
+    exit.store(true, Ordering::SeqCst);
+    let _ = accept_handle.join();
+    drain_result
+}
+
+fn accept_loop(
+            listener: TcpListener,
+            queue:    Arc<SharedQueue>,
+            stats:    Arc<Stats>,
+            state:    Arc<AtomicU8>,
+            exit:     Arc<AtomicBool>,
+        ) {
+    while !exit.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
                 debug!("Spawning handler thread");
@@ -228,9 +267,6 @@ fn run_server(args: &[String]) -> io::Result<()> {
             Err(e) => warn!("Control accept error: '{}'", e),
         }
     }
-
-    // ── Drain phase ─────────────────────────────────────────────────────────
-    drain(queue, stats, state)
 }
 
 fn drain(
@@ -381,6 +417,11 @@ fn handle_control(
     ctrl.read_exact(&mut role)?;
     let role = role[0];
 
+    // ── Admin roles ─────────────────────────────────────────────────────────
+    // Always honored, regardless of lifecycle state. In particular, SHUTDOWN
+    // is honored while DRAINING — that's the whole point of being able to
+    // get impatient.
+
     if role == ROLE_HEALTHCHECK {
         ctrl.write_all(&[ACK_HEALTH])?;
         ctrl.flush()?;
@@ -417,6 +458,19 @@ fn handle_control(
         return Err(
             io::Error::new(io::ErrorKind::InvalidData, "unknown role byte")
         );
+    }
+
+    // ── Producer / consumer ────────────────────────────────────────────────
+    // Only admitted while RUNNING. During drain/shutdown the orchestrator is
+    // trying to wind down; admitting a fresh producer would extend the drain
+    // indefinitely, and a fresh consumer has nothing useful to do (and the
+    // process is about to exit anyway).
+    if state.load(Ordering::SeqCst) != STATE_RUNNING {
+        debug!(
+            "rejecting role 0x{:02x} session: orchestrator is not running",
+            role
+        );
+        return Ok(());
     }
 
     let bind_ip = ctrl.local_addr()?.ip();
