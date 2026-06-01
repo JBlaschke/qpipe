@@ -1,0 +1,15 @@
+[package]
+name = "qpipe-py"
+version = "1.4.0"            # track qpipe's version
+edition = "2024"
+
+[lib]
+name = "_qpipe"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["abi3-py39"] }   # NOT extension-module here
+qpipe = { path = "../.." }                              # in-repo, no git tag needed
+
+[features]
+extension-module = ["pyo3/extension-module"]            # opt-in, maturin turns it on

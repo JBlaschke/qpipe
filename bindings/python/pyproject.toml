@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "qpipe"
+version = "0.1.0"
+description = "Python bindings for qpipe (MPMC work queue)"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"   # pure-Python package lives here
+module-name = "qpipe._qpipe" # native module nested under the package
+
+[project.optional-dependencies]
+msgpack = ["msgpack>=1.0"]
