@@ -202,30 +202,68 @@ pub fn write_frame<S: Write + Read>(
     Ok(())
 }
 
-/// Returns `Ok(None)` on clean EOF (peer closed).
+/// Fill `buf` completely from `s`, distinguishing a clean stream end from a
+/// truncated one — which `Read::read_exact` cannot do, because it reports both
+/// "EOF with 0 bytes read" and "EOF after a partial read" as the same
+/// `UnexpectedEof`, and leaves the buffer contents unspecified.
+///
+/// Returns:
+///   `Ok(true)`           — `buf` was filled completely.
+///   `Ok(false)`          — clean EOF: the stream ended with ZERO bytes read
+///                          into `buf` (i.e. exactly at a frame boundary).
+///   `Err(UnexpectedEof)` — the stream ended PARTWAY through `buf` (truncation).
+///   `Err(_)`             — any other I/O error (incl. read timeouts).
+///
+/// `Interrupted` is retried, matching `read_exact`'s own behavior; `WouldBlock`
+/// / `TimedOut` are propagated (a stalled peer mid-prefix is an error, not a
+/// reason to spin).
+fn read_exact_or_eof<S: Read>(s: &mut S, buf: &mut [u8]) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match s.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return if filled == 0 {
+                    Ok(false) // clean EOF at a boundary: no more frames
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed mid-frame (truncated length prefix)",
+                    ))
+                };
+            }
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {} // retry
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Returns `Ok(None)` only on a *clean* EOF at a frame boundary. A truncated
+/// length prefix or a short payload read is now a hard error, not a silent None.
 pub fn read_frame<S: Read + Write>(s: &mut S) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match s.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    // Clean EOF before any prefix byte => no more frames. A *partial* prefix is
+    // truncation, surfaced as Err by the helper (and propagated by `?`).
+    if !read_exact_or_eof(s, &mut len_buf)? {
+        return Ok(None);
     }
 
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_SIZE {
-        return Err(
-            io::Error::new(
-                io::ErrorKind::InvalidData, "incoming frame too large"
-            )
-        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incoming frame too large",
+        ));
     }
 
-    // Read data
+    // Payload truncation is ALWAYS an error: once we've read a valid length we're
+    // committed to a frame, so a short read means the stream broke. read_exact's
+    // UnexpectedEof is exactly the right signal here — let it propagate via `?`.
     let mut payload = vec![0u8; len];
     s.read_exact(&mut payload)?;
-    // Send acknowledgement
-    s.write_all(&[ACK_PAYLOAD])?;
 
+    s.write_all(&[ACK_PAYLOAD])?;
     Ok(Some(payload))
 }
 
@@ -410,22 +448,11 @@ mod frame_tests {
     }
 
     #[test]
-    fn read_frame_partial_length_prefix_is_none() {
-        // IMPORTANT CONTRACT: read_frame maps *any* UnexpectedEof during the
-        // 4-byte length read to Ok(None) — not just the zero-bytes-read case.
-        // std::io::Read::read_exact returns UnexpectedEof whether 0 OR a partial
-        // number of bytes were read before end-of-stream, and read_frame treats
-        // them identically. So a peer that dies mid-length-prefix is reported as
-        // a clean disconnect (Ok(None)), indistinguishable from a peer that
-        // closed cleanly at a frame boundary.
-        //
-        // This is acceptable for a cooperative queue (write_frame emits the
-        // prefix in a single write_all, so a torn prefix shouldn't occur from a
-        // well-behaved sender), but it does mean a truncated/corrupted prefix is
-        // NOT surfaced as an error. If that ever needs to change, read_frame must
-        // check how many bytes read_exact consumed before EOF.
+    fn read_frame_partial_length_prefix_errors() {
+        // With read_exact_or_eof, a partial prefix (EOF after 1–3 of 4 bytes) is a
+        // truncation error — distinct from a clean boundary EOF (0 bytes -> Ok(None)).
         let mut io = DuplexMock::with_incoming(vec![0x00]);
-        assert_eq!(read_frame(&mut io).unwrap(), None);
+        assert!(read_frame(&mut io).is_err());
     }
 
     #[test]
