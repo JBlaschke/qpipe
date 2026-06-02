@@ -287,3 +287,217 @@ impl Consumer {
         }
     }
 }
+
+// Unit tests for the framing layer. Because write_frame/read_frame are both
+// bounded `Read + Write` (the ACK round-trip is part of the framing layer),
+// we can't drive them with a plain Cursor — we need one object that is BOTH
+// readable and writable. `DuplexMock` is that: an in-memory full-duplex pipe
+// with two independent byte buffers.
+//
+// NOTE: adjust the ACK constant if the crate names it differently. The README
+// documents ACK = 'A' (0x41); if lib.rs exposes a const (e.g. `ACK_BYTE`),
+// prefer referencing that over the literal here.
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use std::io::{self, Read, Write};
+
+    const ACK: u8 = ACK_PAYLOAD; // reference the crate's constant, not a literal
+
+    /// In-memory full-duplex stream.
+    /// - `read_buf`  : bytes the "peer" has sent to us, that our code will read.
+    /// - `write_buf` : bytes our code writes out, that we can inspect afterward.
+    struct DuplexMock {
+        read_buf: io::Cursor<Vec<u8>>,
+        write_buf: Vec<u8>,
+    }
+
+    impl DuplexMock {
+        /// Start with `incoming` queued on the read side.
+        fn with_incoming(incoming: Vec<u8>) -> Self {
+            Self { read_buf: io::Cursor::new(incoming), write_buf: Vec::new() }
+        }
+
+        /// Queue exactly one ACK byte for write_frame's round-trip to consume.
+        fn ready_for_one_ack() -> Self {
+            Self::with_incoming(vec![ACK])
+        }
+
+        /// What our code wrote out.
+        fn written(&self) -> &[u8] {
+            &self.write_buf
+        }
+    }
+
+    impl Read for DuplexMock {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.read_buf.read(buf)
+        }
+    }
+
+    impl Write for DuplexMock {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_buf.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ---- write_frame ----
+
+    #[test]
+    fn write_frame_emits_length_prefix_and_payload() {
+        let mut io = DuplexMock::ready_for_one_ack();
+        write_frame(&mut io, b"hello").unwrap();
+
+        let out = io.written();
+        // [u32 BE length][payload]; ACK flows the other way (into read_buf).
+        assert_eq!(&out[0..4], &5u32.to_be_bytes());
+        assert_eq!(&out[4..9], b"hello");
+    }
+
+    #[test]
+    fn write_frame_empty_payload() {
+        let mut io = DuplexMock::ready_for_one_ack();
+        write_frame(&mut io, b"").unwrap();
+        assert_eq!(io.written(), &0u32.to_be_bytes());
+    }
+
+    #[test]
+    fn write_frame_rejects_oversize() {
+        // One byte over MAX_FRAME_SIZE must be refused on the send path.
+        // If MAX_FRAME_SIZE isn't pub, hardcode 16 * 1024 * 1024.
+        let too_big = vec![0u8; MAX_FRAME_SIZE + 1];
+        let mut io = DuplexMock::ready_for_one_ack();
+        let res = write_frame(&mut io, &too_big);
+        assert!(res.is_err(), "oversize frame should be rejected");
+    }
+
+    // ---- read_frame ----
+
+    /// Build a valid on-the-wire frame body (length prefix + payload), i.e.
+    /// what a reader would find waiting on its read side.
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + payload.len());
+        v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn read_frame_reads_one_payload() {
+        let mut io = DuplexMock::with_incoming(framed(b"world"));
+        let got = read_frame(&mut io).unwrap();
+        assert_eq!(got, Some(b"world".to_vec()));
+        // read_frame should have sent an ACK back out.
+        assert_eq!(io.written(), &[ACK]);
+    }
+
+    #[test]
+    fn read_frame_empty_payload() {
+        let mut io = DuplexMock::with_incoming(framed(b""));
+        assert_eq!(read_frame(&mut io).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn read_frame_clean_eof_is_none() {
+        // Nothing queued: a clean EOF before any length prefix => Ok(None),
+        // NOT an error. This is the signal the data loop uses to stop.
+        let mut io = DuplexMock::with_incoming(Vec::new());
+        assert_eq!(read_frame(&mut io).unwrap(), None);
+    }
+
+    #[test]
+    fn read_frame_partial_length_prefix_is_none() {
+        // IMPORTANT CONTRACT: read_frame maps *any* UnexpectedEof during the
+        // 4-byte length read to Ok(None) — not just the zero-bytes-read case.
+        // std::io::Read::read_exact returns UnexpectedEof whether 0 OR a partial
+        // number of bytes were read before end-of-stream, and read_frame treats
+        // them identically. So a peer that dies mid-length-prefix is reported as
+        // a clean disconnect (Ok(None)), indistinguishable from a peer that
+        // closed cleanly at a frame boundary.
+        //
+        // This is acceptable for a cooperative queue (write_frame emits the
+        // prefix in a single write_all, so a torn prefix shouldn't occur from a
+        // well-behaved sender), but it does mean a truncated/corrupted prefix is
+        // NOT surfaced as an error. If that ever needs to change, read_frame must
+        // check how many bytes read_exact consumed before EOF.
+        let mut io = DuplexMock::with_incoming(vec![0x00]);
+        assert_eq!(read_frame(&mut io).unwrap(), None);
+    }
+
+    #[test]
+    fn read_frame_truncated_payload_errors() {
+        // Claims 10 bytes, supplies 3.
+        let mut wire = 10u32.to_be_bytes().to_vec();
+        wire.extend_from_slice(b"abc");
+        let mut io = DuplexMock::with_incoming(wire);
+        assert!(read_frame(&mut io).is_err());
+    }
+
+    #[test]
+    fn read_frame_rejects_oversize_length() {
+        // A length prefix claiming > MAX_FRAME_SIZE must be rejected before
+        // any attempt to allocate/read that many bytes.
+        let oversize_len = (MAX_FRAME_SIZE as u32) + 1;
+        let mut io = DuplexMock::with_incoming(oversize_len.to_be_bytes().to_vec());
+        assert!(read_frame(&mut io).is_err());
+    }
+
+    // ---- round-trip ----
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        // Write a frame, capture the bytes, feed them into a fresh reader.
+        let payload = b"round-trip payload";
+        let mut writer = DuplexMock::ready_for_one_ack();
+        write_frame(&mut writer, payload).unwrap();
+
+        // The reader sees the length-prefixed body (strip nothing; the ACK was
+        // on the writer's *read* side, not in what it wrote out).
+        let mut reader = DuplexMock::with_incoming(writer.written().to_vec());
+        assert_eq!(read_frame(&mut reader).unwrap(), Some(payload.to_vec()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property-based tests. Requires `proptest` as a dev-dependency:
+//   [dev-dependencies]
+//   proptest = "1"
+// (Remember: add the dep, then `cargo vendor vendor` and commit, or it won't
+//  resolve under the vendored source.)
+#[cfg(test)]
+mod frame_proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::io::{self, Read, Write};
+
+    const ACK: u8 = ACK_PAYLOAD;
+
+    struct DuplexMock {
+        read_buf: io::Cursor<Vec<u8>>,
+        write_buf: Vec<u8>,
+    }
+    impl Read for DuplexMock {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> { self.read_buf.read(b) }
+    }
+    impl Write for DuplexMock {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> { self.write_buf.write(b) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    proptest! {
+        // Any payload within the size cap must survive write -> read unchanged.
+        #[test]
+        fn arbitrary_payload_roundtrips(payload in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let mut writer = DuplexMock { read_buf: io::Cursor::new(vec![ACK]), write_buf: Vec::new() };
+            write_frame(&mut writer, &payload).unwrap();
+
+            let mut reader = DuplexMock { read_buf: io::Cursor::new(writer.write_buf.clone()), write_buf: Vec::new() };
+            let got = read_frame(&mut reader).unwrap();
+            prop_assert_eq!(got, Some(payload));
+        }
+    }
+}

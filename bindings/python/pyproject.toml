@@ -19,3 +19,8 @@ module-name = "qpipe._qpipe" # native module nested under the package
 
 [project.optional-dependencies]
 msgpack = ["msgpack>=1.0"]
+
+[tool.pytest.ini_options]
+markers = ["e2e: spawns the orchestrator binary; needs the built extension"]
+[dependency-groups]              # or [project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2", "msgpack>=1.0"]
