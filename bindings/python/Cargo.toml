@@ -1,6 +1,6 @@
 [package]
 name = "qpipe-py"
-version = "1.4.1"            # track qpipe's version
+version = "1.4.2"            # track qpipe's version
 edition = "2024"
 
 [lib]
