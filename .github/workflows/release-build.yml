@@ -19,7 +19,13 @@ jobs:
   # PyPI publish happens inside on tag pushes — same bytes go to PyPI and tars.
   wheels:
     name: Python wheels (reusable workflow)
-    uses: .github/workflows/wheels.yml
+    # Same-repo reusable workflow syntax: leading "./", NO @ref. GitHub resolves
+    # this at the CALLER's commit (caller+callee versioned atomically). The path
+    # must match the real filename exactly, the file must live directly in
+    # .github/workflows/ (no subdirs), exist on the ref being run, and declare
+    # `on: workflow_call`. Repo-form (owner/repo/...@ref) would require a ref and
+    # would decouple the callee's version from the tag — don't.
+    uses: ./.github/workflows/wheels.yml
     permissions:
       contents: read
       id-token: write       # Trusted Publishing OIDC for the publish job inside
