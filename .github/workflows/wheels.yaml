@@ -104,23 +104,44 @@ jobs:
 
       # Keep the wheel version == the release tag, so PyPI uploads can't drift.
       # (PyPI versions are immutable; a mismatch is painful to undo.)
+      # Handles both an explicit `version = "..."` in the binding AND a workspace-
+      # inherited `version.workspace = true` (in which case the source of truth is
+      # the root [workspace.package]). The edit is ephemeral — this runner's
+      # checkout only — so it never touches your repo or the binaries workflow.
       - name: Sync wheel version to tag
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME#v}"
           python - "$VER" <<'PY'
-          import sys, re, pathlib
+          import sys, re, pathlib, tomllib
+
           ver = sys.argv[1]
-          p = pathlib.Path("bindings/python/Cargo.toml")
-          txt = p.read_text()
-          # Replace `version = "..."` only within the [package] section.
-          new = re.sub(r'(?ms)(^\[package\].*?^\s*version\s*=\s*")[^"]*(")',
-                       rf'\g<1>{ver}\g<2>', txt, count=1)
-          if new == txt:
-              raise SystemExit("could not find [package] version to sync")
-          p.write_text(new)
-          print(f"binding version set to {ver}")
+          binding = pathlib.Path("bindings/python/Cargo.toml")
+          pkgver = tomllib.loads(binding.read_text()).get("package", {}).get("version")
+
+          def set_version(path, section):
+              txt = path.read_text()
+              pat = re.compile(
+                  r'(?ms)(^\[' + re.escape(section) + r'\].*?^\s*version\s*=\s*")[^"]*(")'
+              )
+              new, n = pat.subn(rf'\g<1>{ver}\g<2>', txt, count=1)
+              if n == 0:
+                  raise SystemExit(f'no `version = "..."` under [{section}] in {path}')
+              path.write_text(new)
+              print(f'set version {ver} under [{section}] in {path}')
+
+          if isinstance(pkgver, str):
+              # binding carries its own explicit version
+              set_version(binding, "package")
+          elif isinstance(pkgver, dict) and pkgver.get("workspace") is True:
+              # binding inherits from the workspace root
+              set_version(pathlib.Path("Cargo.toml"), "workspace.package")
+          else:
+              raise SystemExit(
+                  f"unexpected package.version = {pkgver!r} in {binding}; "
+                  'expected a string or `version.workspace = true`'
+              )
           PY
 
       # ---- Build the abi3 extension wheel ----
