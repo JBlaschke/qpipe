@@ -1,18 +1,32 @@
+# NOTE: PyPI Trusted Publishing must point at THIS file's name (the calling
+# workflow), not wheels.yml — reusable workflows are validated by the top-level
+# workflow_ref claim.
 name: Build & attach Rust binaries (multi-platform)
 
 on:
   push:
     tags:
       - "v*"
-      # If you want *any* tag to trigger, replace the above with:
-      # - "*"
+  workflow_dispatch: {}     # dry run: builds binaries + wheels + tars, no PyPI publish,
+                            # no version sync (archives are named after the branch)
 
 permissions:
   contents: write
 
 jobs:
+  # Build all PyPI wheels (with bundled binaries) via the reusable workflow.
+  # Their artifacts (wheel-<tag>) are visible to this run's later jobs, and the
+  # PyPI publish happens inside on tag pushes — same bytes go to PyPI and tars.
+  wheels:
+    name: Python wheels (reusable workflow)
+    uses: ./.github/workflows/wheels.yml
+    permissions:
+      contents: read
+      id-token: write       # Trusted Publishing OIDC for the publish job inside
+
   build:
     name: Build ${{ matrix.asset_target }}
+    needs: wheels           # packaging consumes the wheel artifacts from above
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +41,7 @@ jobs:
             asset_target: x86_64-unknown-linux-gnu.2.32
             builder: zigbuild
             archive_ext: tar.gz
+            wheel_artifact: wheel-manylinux2014_x86_64
 
           - runs_on: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
@@ -34,6 +49,7 @@ jobs:
             asset_target: aarch64-unknown-linux-gnu.2.32
             builder: zigbuild
             archive_ext: tar.gz
+            wheel_artifact: wheel-manylinux2014_aarch64
 
           - runs_on: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
@@ -41,6 +57,7 @@ jobs:
             asset_target: x86_64-unknown-linux-gnu.2.43
             builder: zigbuild
             archive_ext: tar.gz
+            wheel_artifact: wheel-manylinux2014_x86_64   # same wheel as 2.32: manylinux floor covers both
 
           - runs_on: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
@@ -48,10 +65,10 @@ jobs:
             asset_target: aarch64-unknown-linux-gnu.2.43
             builder: zigbuild
             archive_ext: tar.gz
+            wheel_artifact: wheel-manylinux2014_aarch64
 
           # -------------------------
           # Linux (musl) - uses zigbuild
-          # Often fully static; avoids glibc compatibility issues entirely
           # -------------------------
           - runs_on: ubuntu-24.04
             rust_target: x86_64-unknown-linux-musl
@@ -59,6 +76,7 @@ jobs:
             asset_target: x86_64-unknown-linux-musl
             builder: zigbuild
             archive_ext: tar.gz
+            wheel_artifact: wheel-musllinux_1_2_x86_64
 
           - runs_on: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-musl
@@ -66,10 +84,11 @@ jobs:
             asset_target: aarch64-unknown-linux-musl
             builder: zigbuild
             archive_ext: tar.gz
+            wheel_artifact: wheel-musllinux_1_2_aarch64
 
           # -------------------------
-          # FreeBSD (built inside VM) - tar.gz
-          # Build on FreeBSD 13.x to avoid FBSD_1.7 (FreeBSD 14 ABI).
+          # FreeBSD (built inside VM) — NOT a PyPI platform, so the wheel is
+          # built in the VM and exists only in this tar (wheel_artifact empty).
           # -------------------------
           - runs_on: ubuntu-24.04
             builder: freebsd-vm
@@ -79,6 +98,7 @@ jobs:
             build_target: x86_64-unknown-freebsd
             asset_target: x86_64-unknown-freebsd13.5
             archive_ext: tar.gz
+            wheel_artifact: ""
 
           - runs_on: ubuntu-24.04
             builder: freebsd-vm
@@ -88,6 +108,7 @@ jobs:
             build_target: aarch64-unknown-freebsd
             asset_target: aarch64-unknown-freebsd13.5
             archive_ext: tar.gz
+            wheel_artifact: ""
 
           # -------------------------
           # Windows (native cargo build)
@@ -98,6 +119,7 @@ jobs:
             asset_target: x86_64-pc-windows-msvc
             builder: cargo
             archive_ext: zip
+            wheel_artifact: wheel-win_amd64
 
           - runs_on: windows-11-arm
             rust_target: aarch64-pc-windows-msvc
@@ -105,6 +127,7 @@ jobs:
             asset_target: aarch64-pc-windows-msvc
             builder: cargo
             archive_ext: zip
+            wheel_artifact: wheel-win_arm64
 
           # -------------------------
           # macOS (native cargo build)
@@ -115,6 +138,7 @@ jobs:
             asset_target: x86_64-apple-darwin
             builder: cargo
             archive_ext: tar.gz
+            wheel_artifact: wheel-macosx_x86_64
 
           - runs_on: macos-15
             rust_target: aarch64-apple-darwin
@@ -122,6 +146,7 @@ jobs:
             asset_target: aarch64-apple-darwin
             builder: cargo
             archive_ext: tar.gz
+            wheel_artifact: wheel-macosx_arm64
 
     runs-on: ${{ matrix.runs_on }}
 
@@ -132,6 +157,43 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+
+      # Same sync as wheels.yml: stamps the tag version onto the workspace so the
+      # FreeBSD VM wheel (and the binaries' CARGO_PKG_VERSION) match the release.
+      # Ephemeral — this runner's checkout only. Skipped on workflow_dispatch.
+      - name: Sync workspace version to tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          python - "$VER" <<'PY'
+          import sys, re, pathlib, tomllib
+
+          ver = sys.argv[1]
+          binding = pathlib.Path("bindings/python/Cargo.toml")
+          pkgver = tomllib.loads(binding.read_text()).get("package", {}).get("version")
+
+          def set_version(path, section):
+              txt = path.read_text()
+              pat = re.compile(
+                  r'(?ms)(^\[' + re.escape(section) + r'\].*?^\s*version\s*=\s*")[^"]*(")'
+              )
+              new, n = pat.subn(rf'\g<1>{ver}\g<2>', txt, count=1)
+              if n == 0:
+                  raise SystemExit(f'no `version = "..."` under [{section}] in {path}')
+              path.write_text(new)
+              print(f'set version {ver} under [{section}] in {path}')
+
+          if isinstance(pkgver, str):
+              set_version(binding, "package")
+          elif isinstance(pkgver, dict) and pkgver.get("workspace") is True:
+              set_version(pathlib.Path("Cargo.toml"), "workspace.package")
+          else:
+              raise SystemExit(
+                  f"unexpected package.version = {pkgver!r} in {binding}; "
+                  'expected a string or `version.workspace = true`'
+              )
+          PY
 
       - name: Install Rust (stable, with targets)
         if: matrix.builder != 'freebsd-vm'
@@ -176,7 +238,7 @@ jobs:
           usesh: true
           prepare: |
             pkg update -f
-            pkg install -y rust
+            pkg install -y rust python311 py311-pip
           run: |
             set -eu
             cd "$GITHUB_WORKSPACE"
@@ -187,7 +249,32 @@ jobs:
 
             cargo build --release --offline --bins --target ${{ matrix.build_target }}
 
-      - name: Package archive (all binaries)
+            # ---- Python wheel: FreeBSD is not a PyPI platform; the tar IS its channel ----
+            # maturin has no FreeBSD prebuilt; pip compiles it from sdist with the
+            # rust already installed (a few minutes). `pkg install py311-maturin`
+            # is a faster substitute if the port is available for this release.
+            python3.11 -m pip install --break-system-packages maturin wheel
+            maturin build --release \
+              --manifest-path bindings/python/Cargo.toml \
+              --out wheelhouse
+
+            # Same binary bundling as the PyPI wheels: orchestrator/producer/consumer
+            # onto the venv PATH on install.
+            BIN_BUILD_TARGET="${{ matrix.build_target }}" \
+            RUST_TARGET="${{ matrix.rust_target }}" \
+            WHEEL_DIR=wheelhouse \
+              python3.11 .github/scripts/inject_bins_into_wheel.py
+
+      # Non-FreeBSD targets: take the wheel from the wheels job in this same run —
+      # identical bytes to what was published to PyPI.
+      - name: Download matching Python wheel
+        if: matrix.wheel_artifact != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.wheel_artifact }}
+          path: wheelhouse
+
+      - name: Package archive (all binaries + wheel)
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.build_target }}
@@ -196,6 +283,8 @@ jobs:
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
           # Optional override (repo variable): "parallel-tar parallel-idx view-idx"
           BIN_NAMES: ${{ vars.BIN_NAMES }}
+          WHEEL_DIR: wheelhouse
+          REQUIRE_WHEEL: "1"
         run: python .github/scripts/package_release.py
 
       - name: Upload artifact (for release job)
@@ -209,8 +298,9 @@ jobs:
 
   release:
     name: Attach artifacts to GitHub Release
-    needs: build
+    needs: [build, wheels]
     runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - name: Download all build artifacts
@@ -224,5 +314,6 @@ jobs:
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
+            artifacts/**/*.whl
           generate_release_notes: true
           fail_on_unmatched_files: true

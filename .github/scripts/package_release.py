@@ -92,6 +92,20 @@ def copy_if_exists(src: pathlib.Path, dst_dir: pathlib.Path) -> None:
     if src.exists():
         shutil.copy2(src, dst_dir / src.name)
 
+def copy_wheels(dist: pathlib.Path) -> None:
+    """Include any .whl from WHEEL_DIR (default ./wheelhouse) in the archive.
+    With REQUIRE_WHEEL set, a missing wheel is a hard error rather than a
+    silently thinner tar."""
+    wheel_dir = pathlib.Path(os.getenv("WHEEL_DIR", "wheelhouse"))
+    require = os.getenv("REQUIRE_WHEEL", "") not in ("", "0", "false")
+    whls = sorted(wheel_dir.glob("*.whl")) if wheel_dir.is_dir() else []
+    if not whls:
+        if require:
+            raise SystemExit(f"REQUIRE_WHEEL is set but no .whl found in {wheel_dir}/")
+        return
+    for w in whls:
+        shutil.copy2(w, dist / w.name)
+    print(f"Included wheel(s): {', '.join(w.name for w in whls)}")
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Package Rust release binaries into an archive.")
@@ -163,6 +177,8 @@ def main() -> None:
     # Optional docs
     for fn in ("README.md", "README.txt", "LICENSE", "LICENSE.md", "COPYING", "CLA.md", "COMMERCIAL.md"):
         copy_if_exists(pathlib.Path(fn), dist)
+
+    copy_wheels(dist)
 
     archive = pathlib.Path(f"{out_name}.{args.archive_ext}")
     if archive.exists():

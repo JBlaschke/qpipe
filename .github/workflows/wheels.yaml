@@ -1,10 +1,8 @@
 name: Build Python wheels & publish to PyPI
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch: {}        # manual runs build wheels but do NOT publish (see `publish` job guard)
+  workflow_call: {}        # invoked by the release workflow on tag pushes
+  workflow_dispatch: {}    # standalone dry runs (build + verify, no publish)eels but do NOT publish (see `publish` job guard)
 
 permissions:
   contents: read
