@@ -27,8 +27,10 @@ jobs:
     # would decouple the callee's version from the tag — don't.
     uses: ./.github/workflows/wheels.yml
     permissions:
-      contents: read
-      id-token: write       # Trusted Publishing OIDC for the publish job inside
+      contents: read        # build-only: PyPI publishing moved to THIS caller.
+                            # PyPI validates the job_workflow_ref claim (the file a
+                            # job is defined in); inside a reusable workflow that
+                            # points at wheels.yml, which PyPI doesn't support.
 
   build:
     name: Build ${{ matrix.asset_target }}
@@ -301,6 +303,35 @@ jobs:
             *.tar.gz
             *.zip
           if-no-files-found: error
+
+  # PyPI publish lives in THIS file, not wheels.yml: Trusted Publishing matches
+  # the job_workflow_ref claim — the workflow file the job is DEFINED in — and
+  # reusable workflows are unsupported. Here, job_workflow_ref == workflow_ref ==
+  # release-build.yml, matching the registered publisher exactly.
+  publish:
+    name: Publish to PyPI
+    needs: [wheels, build]    # publish only once the ENTIRE release is green —
+                              # PyPI versions are immutable, so no early uploads
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: wheel-*        # PyPI-eligible wheels only; the FreeBSD wheel is
+          merge-multiple: true    # tar-only by design (PyPI rejects its platform tag)
+
+      - name: List artifacts
+        run: ls -l dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true     # idempotent reruns after a partial upload
 
   release:
     name: Attach artifacts to GitHub Release
