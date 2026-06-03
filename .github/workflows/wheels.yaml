@@ -1,0 +1,177 @@
+name: Build Python wheels & publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}        # manual runs build wheels but do NOT publish (see `publish` job guard)
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: Wheel ${{ matrix.wheel_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # -------- Linux glibc: ONE wheel per arch at the manylinux2014 floor (glibc 2.17).
+          # Covers the whole fleet (>= 2.32) and older. The .2.32/.2.43 split in the
+          # binaries workflow does not apply here — pip selects by manylinux tag. --------
+          - runs_on: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            wheel_tag: manylinux2014_x86_64
+            compat: manylinux2014
+            os_family: linux
+          - runs_on: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            wheel_tag: manylinux2014_aarch64
+            compat: manylinux2014
+            os_family: linux
+
+          # -------- Linux musl (static) --------
+          - runs_on: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            wheel_tag: musllinux_1_2_x86_64
+            compat: musllinux_1_2
+            os_family: linux
+          - runs_on: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            wheel_tag: musllinux_1_2_aarch64
+            compat: musllinux_1_2
+            os_family: linux
+
+          # -------- macOS (native) --------
+          - runs_on: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            wheel_tag: macosx_x86_64
+            os_family: macos
+          - runs_on: macos-15
+            rust_target: aarch64-apple-darwin
+            wheel_tag: macosx_arm64
+            os_family: macos
+
+          # -------- Windows (native) --------
+          - runs_on: windows-2022
+            rust_target: x86_64-pc-windows-msvc
+            wheel_tag: win_amd64
+            os_family: windows
+          - runs_on: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            wheel_tag: win_arm64
+            os_family: windows
+
+          # NOTE: FreeBSD is intentionally absent — it is not a PyPI wheel platform.
+          # FreeBSD bindings are built in the FreeBSD VM and shipped in the release
+          # tar (model 2), not here.
+
+    runs-on: ${{ matrix.runs_on }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python (build interpreter; abi3 floor is 3.9 regardless)
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust (stable, with target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wheels-${{ matrix.wheel_tag }}
+
+      # zig + cargo-zigbuild are used for the Linux targets so the glibc/musl floor
+      # is controlled on the host (same toolchain your binaries workflow uses) —
+      # no manylinux docker image needed.
+      - name: Install Zig
+        if: matrix.os_family == 'linux'
+        uses: mlugg/setup-zig@v2
+      - name: Install cargo-zigbuild
+        if: matrix.os_family == 'linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install maturin
+        shell: bash
+        run: pip install "maturin>=1.7,<2.0"
+
+      # Keep the wheel version == the release tag, so PyPI uploads can't drift.
+      # (PyPI versions are immutable; a mismatch is painful to undo.)
+      - name: Sync wheel version to tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          python - "$VER" <<'PY'
+          import sys, re, pathlib
+          ver = sys.argv[1]
+          p = pathlib.Path("bindings/python/Cargo.toml")
+          txt = p.read_text()
+          # Replace `version = "..."` only within the [package] section.
+          new = re.sub(r'(?ms)(^\[package\].*?^\s*version\s*=\s*")[^"]*(")',
+                       rf'\g<1>{ver}\g<2>', txt, count=1)
+          if new == txt:
+              raise SystemExit("could not find [package] version to sync")
+          p.write_text(new)
+          print(f"binding version set to {ver}")
+          PY
+
+      # ---- Build the abi3 extension wheel ----
+      - name: Build wheel (Linux, via zig at the chosen libc floor)
+        if: matrix.os_family == 'linux'
+        shell: bash
+        run: >
+          maturin build --release --zig
+          --target ${{ matrix.rust_target }}
+          --compatibility ${{ matrix.compat }}
+          --manifest-path bindings/python/Cargo.toml
+          --out dist
+
+      - name: Build wheel (macOS / Windows, native)
+        if: matrix.os_family != 'linux'
+        shell: bash
+        run: >
+          maturin build --release
+          --target ${{ matrix.rust_target }}
+          --manifest-path bindings/python/Cargo.toml
+          --out dist
+
+      - name: Show wheel
+        shell: bash
+        run: ls -l dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.wheel_tag }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: wheels
+    runs-on: ubuntu-24.04
+    # Only publish on a real tag push — manual workflow_dispatch runs build but don't upload.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi               # configure a PyPI Trusted Publisher against this repo+workflow+environment
+    permissions:
+      id-token: write               # OIDC for Trusted Publishing (no API token in secrets)
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -l dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
