@@ -19,7 +19,7 @@ jobs:
   # PyPI publish happens inside on tag pushes — same bytes go to PyPI and tars.
   wheels:
     name: Python wheels (reusable workflow)
-    uses: ./.github/workflows/wheels.yml
+    uses: .github/workflows/wheels.yml
     permissions:
       contents: read
       id-token: write       # Trusted Publishing OIDC for the publish job inside
