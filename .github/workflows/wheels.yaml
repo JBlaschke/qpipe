@@ -199,7 +199,10 @@ jobs:
       # ---- Verify: install the injected wheel into a clean venv ----
       # Catches the silent failure mode where a misnamed .data dir makes
       # installers treat the binaries as package payload instead of scripts.
-      - name: Verify wheel installs with binaries
+      - name: Verify wheel installs with binaries (native)
+        # musllinux wheels are excluded: pip refuses them on a glibc runner by
+        # platform-tag rules — they get a real musl check in the Alpine step below.
+        if: matrix.compat != 'musllinux_1_2'
         shell: bash
         run: |
           python -m venv _verify
@@ -217,6 +220,28 @@ jobs:
             echo "orchestrator present but not executable"; exit 1
           fi
           echo "venv bin contents:"; ls -l "$VBIN"
+
+      # musllinux wheels: verify inside an actual musl platform (Alpine container).
+      # This is a stronger check than the native one — the musl-linked extension
+      # really loads, and pip's tag matching runs against a genuine musl Python.
+      # The container arch matches the runner arch, which matches the wheel arch.
+      - name: Verify wheel installs with binaries (musllinux, Alpine container)
+        if: matrix.compat == 'musllinux_1_2'
+        shell: bash
+        run: |
+          cat > /tmp/verify.sh <<'EOF'
+          set -e
+          apk add --no-cache python3 py3-pip >/dev/null
+          pip install --quiet --break-system-packages --no-index --find-links /dist qpipe-rs
+          python3 -c 'import qpipe, importlib.metadata as md; print("import OK, dist:", md.version("qpipe-rs"))'
+          BIN="$(command -v orchestrator)" || { echo "orchestrator not on PATH after install"; exit 1; }
+          test -x "$BIN"
+          echo "orchestrator at: $BIN"
+          EOF
+          docker run --rm \
+            -v "$PWD/dist:/dist:ro" \
+            -v /tmp/verify.sh:/verify.sh:ro \
+            alpine:3.20 sh /verify.sh
 
       - name: Show wheel
         shell: bash
