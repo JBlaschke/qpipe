@@ -17,15 +17,18 @@ jobs:
       matrix:
         include:
           # -------- Linux glibc: ONE wheel per arch at the manylinux2014 floor (glibc 2.17).
-          # Covers the whole fleet (>= 2.32) and older. The .2.32/.2.43 split in the
-          # binaries workflow does not apply here — pip selects by manylinux tag. --------
+          # The bundled binaries are built at the SAME floor (bin_target …gnu.2.17) so the
+          # manylinux tag stays honest. These are separate from the .2.32/.2.43 binaries
+          # the release-tar workflow ships. --------
           - runs_on: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
+            bin_target: x86_64-unknown-linux-gnu.2.17
             wheel_tag: manylinux2014_x86_64
             compat: manylinux2014
             os_family: linux
           - runs_on: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
+            bin_target: aarch64-unknown-linux-gnu.2.17
             wheel_tag: manylinux2014_aarch64
             compat: manylinux2014
             os_family: linux
@@ -33,11 +36,13 @@ jobs:
           # -------- Linux musl (static) --------
           - runs_on: ubuntu-24.04
             rust_target: x86_64-unknown-linux-musl
+            bin_target: x86_64-unknown-linux-musl
             wheel_tag: musllinux_1_2_x86_64
             compat: musllinux_1_2
             os_family: linux
           - runs_on: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-musl
+            bin_target: aarch64-unknown-linux-musl
             wheel_tag: musllinux_1_2_aarch64
             compat: musllinux_1_2
             os_family: linux
@@ -45,20 +50,24 @@ jobs:
           # -------- macOS (native) --------
           - runs_on: macos-15-intel
             rust_target: x86_64-apple-darwin
+            bin_target: x86_64-apple-darwin
             wheel_tag: macosx_x86_64
             os_family: macos
           - runs_on: macos-15
             rust_target: aarch64-apple-darwin
+            bin_target: aarch64-apple-darwin
             wheel_tag: macosx_arm64
             os_family: macos
 
           # -------- Windows (native) --------
           - runs_on: windows-2022
             rust_target: x86_64-pc-windows-msvc
+            bin_target: x86_64-pc-windows-msvc
             wheel_tag: win_amd64
             os_family: windows
           - runs_on: windows-11-arm
             rust_target: aarch64-pc-windows-msvc
+            bin_target: aarch64-pc-windows-msvc
             wheel_tag: win_arm64
             os_family: windows
 
@@ -87,8 +96,7 @@ jobs:
           shared-key: wheels-${{ matrix.wheel_tag }}
 
       # zig + cargo-zigbuild are used for the Linux targets so the glibc/musl floor
-      # is controlled on the host (same toolchain your binaries workflow uses) —
-      # no manylinux docker image needed.
+      # is controlled on the host (same toolchain the binaries workflow uses).
       - name: Install Zig
         if: matrix.os_family == 'linux'
         uses: mlugg/setup-zig@v2
@@ -98,9 +106,9 @@ jobs:
         with:
           tool: cargo-zigbuild
 
-      - name: Install maturin
+      - name: Install maturin + wheel tool
         shell: bash
-        run: pip install "maturin>=1.7,<2.0"
+        run: pip install "maturin>=1.7,<2.0" wheel
 
       # Keep the wheel version == the release tag, so PyPI uploads can't drift.
       # (PyPI versions are immutable; a mismatch is painful to undo.)
@@ -164,6 +172,52 @@ jobs:
           --manifest-path bindings/python/Cargo.toml
           --out dist
 
+      # ---- Build the binaries that ride inside the wheel ----
+      # Linux: zigbuild pins the libc floor to match the wheel tag (gnu.2.17 / musl).
+      - name: Build bundled binaries (Linux, zigbuild)
+        if: matrix.os_family == 'linux'
+        shell: bash
+        run: cargo zigbuild --release --offline --bins --target ${{ matrix.bin_target }}
+
+      - name: Build bundled binaries (macOS / Windows, native)
+        if: matrix.os_family != 'linux'
+        shell: bash
+        run: cargo build --release --offline --bins --target ${{ matrix.bin_target }}
+
+      # ---- Inject the binaries into the wheel's .data/scripts/ ----
+      # (installers place these on the venv PATH and mark them executable)
+      - name: Inject binaries into wheel
+        shell: bash
+        env:
+          BIN_BUILD_TARGET: ${{ matrix.bin_target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          # Same repo variable the release-tar packaging honors, so both
+          # channels always ship the same set of binaries.
+          BIN_NAMES: ${{ vars.BIN_NAMES }}
+        run: python .github/scripts/inject_bins_into_wheel.py
+
+      # ---- Verify: install the injected wheel into a clean venv ----
+      # Catches the silent failure mode where a misnamed .data dir makes
+      # installers treat the binaries as package payload instead of scripts.
+      - name: Verify wheel installs with binaries
+        shell: bash
+        run: |
+          python -m venv _verify
+          if [ -e _verify/Scripts/python.exe ]; then
+            PY=_verify/Scripts/python.exe; VBIN=_verify/Scripts; EXE=.exe
+          else
+            PY=_verify/bin/python; VBIN=_verify/bin; EXE=
+          fi
+          "$PY" -m pip install --no-index --find-links dist qpipe-rs
+          "$PY" -c "import qpipe, importlib.metadata as md; print('import OK, dist:', md.version('qpipe-rs'))"
+          if [ ! -e "$VBIN/orchestrator$EXE" ]; then
+            echo "orchestrator$EXE missing from $VBIN:"; ls -l "$VBIN"; exit 1
+          fi
+          if [ -z "$EXE" ] && [ ! -x "$VBIN/orchestrator" ]; then
+            echo "orchestrator present but not executable"; exit 1
+          fi
+          echo "venv bin contents:"; ls -l "$VBIN"
+
       - name: Show wheel
         shell: bash
         run: ls -l dist/
@@ -180,7 +234,7 @@ jobs:
     runs-on: ubuntu-24.04
     # Only publish on a real tag push — manual workflow_dispatch runs build but don't upload.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    environment: pypi               # configure a PyPI Trusted Publisher against this repo+workflow+environment
+    environment: pypi               # PyPI Trusted Publisher: repo + wheels.yml + environment 'pypi', project 'qpipe-rs'
     permissions:
       id-token: write               # OIDC for Trusted Publishing (no API token in secrets)
     steps:
