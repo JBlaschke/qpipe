@@ -28,7 +28,7 @@ __all__ = [
     "Producer", "Consumer", "QpipeError", "healthcheck", "wait_until_healthy",
     "request_drain", "request_shutdown", "__version__"
 ]
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 
 # ----- codecs -----
