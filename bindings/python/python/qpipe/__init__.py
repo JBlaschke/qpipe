@@ -18,10 +18,17 @@ from __future__ import annotations
 import json as _json
 from typing import Any
 
-from ._qpipe import Producer as _Producer, Consumer as _Consumer, QpipeError
+from ._qpipe import (
+    Producer as _Producer, Consumer as _Consumer, QpipeError,
+    healthcheck, wait_until_healthy, request_drain, request_shutdown
+)
 
-__all__ = ["Producer", "Consumer", "QpipeError", "__version__"]
-__version__ = "1.4.0"
+# ...and add the four names to __all__
+__all__ = [
+    "Producer", "Consumer", "QpipeError", "healthcheck", "wait_until_healthy",
+    "request_drain", "request_shutdown", "__version__"
+]
+__version__ = "1.4.2"
 
 
 # ----- codecs -----

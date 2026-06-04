@@ -3,6 +3,7 @@
 // PyO3 bindings for qpipe. Exposes Producer and Consumer as Python classes
 // with context-manager + iterator support. Releases the GIL around all
 // blocking network I/O so other Python threads can run.
+use std::time::Duration;
 
 use pyo3::create_exception;
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopIteration};
@@ -152,6 +153,44 @@ impl Consumer {
     }
 }
 
+// ---------- orchestrator control ----------
+// (add `use std::time::Duration;` to the imports)
+
+/// Liveness probe: Ok(()) iff an orchestrator answers at `addr`.
+#[pyfunction]
+fn healthcheck(py: Python<'_>, addr: &str) -> PyResult<()> {
+    let a = addr.to_owned();
+    py.detach(move || qpipe::healthcheck(&a))
+        .map_err(|e| QpipeError::new_err(format!("healthcheck failed: {e}")))
+}
+
+/// Block until healthy, or until `timeout` seconds elapse (None = forever).
+#[pyfunction]
+#[pyo3(signature = (addr, timeout=None))]
+fn wait_until_healthy(py: Python<'_>, addr: &str, timeout: Option<f64>) -> PyResult<()> {
+    let a = addr.to_owned();
+    let t = timeout.map(Duration::from_secs_f64);
+    py.detach(move || qpipe::wait_until_healthy(&a, t))
+        .map_err(|e| QpipeError::new_err(format!("wait_until_healthy failed: {e}")))
+}
+
+/// Enter drain mode. ACK-ON-RECEIPT: returns when the orchestrator
+/// acknowledges the request, NOT when draining completes.
+#[pyfunction]
+fn request_drain(py: Python<'_>, addr: &str) -> PyResult<()> {
+    let a = addr.to_owned();
+    py.detach(move || qpipe::request_drain(&a))
+        .map_err(|e| QpipeError::new_err(format!("drain request failed: {e}")))
+}
+
+/// Graceful shutdown (server-side timeout applies; overrides a drain). Ack-on-receipt.
+#[pyfunction]
+fn request_shutdown(py: Python<'_>, addr: &str) -> PyResult<()> {
+    let a = addr.to_owned();
+    py.detach(move || qpipe::request_shutdown(&a))
+        .map_err(|e| QpipeError::new_err(format!("shutdown request failed: {e}")))
+}
+
 // ---------- module ----------
 
 #[pymodule]
@@ -160,5 +199,10 @@ fn _qpipe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Consumer>()?;
     // Distinct qpipe error type (subclass of ConnectionError).
     m.add("QpipeError", m.py().get_type::<QpipeError>())?;
+    // Orchestrator control
+    m.add_function(wrap_pyfunction!(healthcheck, m)?)?;
+    m.add_function(wrap_pyfunction!(wait_until_healthy, m)?)?;
+    m.add_function(wrap_pyfunction!(request_drain, m)?)?;
+    m.add_function(wrap_pyfunction!(request_shutdown, m)?)?;
     Ok(())
 }
