@@ -16,7 +16,7 @@ for a custom codec.
 from __future__ import annotations
 
 import json as _json
-from typing import Any
+from typing import Any, Self
 
 from ._qpipe import (
     Producer as _Producer, Consumer as _Consumer, QpipeError,
@@ -28,7 +28,7 @@ __all__ = [
     "Producer", "Consumer", "QpipeError", "healthcheck", "wait_until_healthy",
     "request_drain", "request_shutdown", "__version__"
 ]
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 
 # ----- codecs -----
@@ -95,12 +95,14 @@ def _resolve_codec(codec: Any) -> Any:
 class Producer:
     """Push frames to an orchestrator. `with` closes on exit."""
 
+    __slots__ = ("_inner", "_codec")
+
     def __init__(self, inner: _Producer, codec: Any) -> None:
         self._inner = inner
         self._codec = codec
 
     @classmethod
-    def connect(cls, addr: str, codec: Any = "raw") -> "Producer":
+    def connect(cls, addr: str, codec: Any = "raw") -> Self:
         return cls(_Producer.connect(addr), _resolve_codec(codec))
 
     def send(self, obj: Any) -> None:
@@ -125,12 +127,14 @@ class Producer:
 class Consumer:
     """Pull frames from an orchestrator. Iterable; stops when the connection drops."""
 
+    __slots__ = ("_inner", "_codec")
+
     def __init__(self, inner: _Consumer, codec: Any) -> None:
         self._inner = inner
         self._codec = codec
 
     @classmethod
-    def connect(cls, addr: str, codec: Any = "raw") -> "Consumer":
+    def connect(cls, addr: str, codec: Any = "raw") -> Self:
         return cls(_Consumer.connect(addr), _resolve_codec(codec))
 
     def recv(self) -> Any:

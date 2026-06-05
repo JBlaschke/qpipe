@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "qpipe"
-version = "1.4.3"
+version = "1.4.4"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "qpipe-py"
-version = "1.4.3"
+version = "1.4.4"
 dependencies = [
  "pyo3",
  "qpipe",
