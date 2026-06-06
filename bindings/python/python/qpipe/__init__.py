@@ -12,6 +12,12 @@ actually about payload encoding.
 
 Pass a name, or any object with .encode(obj)->bytes and .decode(bytes)->obj
 for a custom codec.
+
+Messages of any size: payloads larger than MAX_FRAME_SIZE are transparently
+chunked by send() and reassembled by recv(), which returns complete messages
+in completion order. Partial messages orphaned by producer failures can be
+inspected with Consumer.pending_partials() and discarded with
+Consumer.gc_partials().
 """
 from __future__ import annotations
 
@@ -20,15 +26,19 @@ from typing import Any, Self
 
 from ._qpipe import (
     Producer as _Producer, Consumer as _Consumer, QpipeError,
-    healthcheck, wait_until_healthy, request_drain, request_shutdown
+    healthcheck, wait_until_healthy, request_drain, request_shutdown,
+    MAX_FRAME_SIZE, CHUNK_HEADER_LEN, MAX_CHUNK_PAYLOAD,
+    MAX_CHUNKS, MAX_MESSAGE_SIZE, FRAME_FLAG_CHUNK,
 )
 
-# ...and add the four names to __all__
 __all__ = [
     "Producer", "Consumer", "QpipeError", "healthcheck", "wait_until_healthy",
-    "request_drain", "request_shutdown", "__version__"
+    "request_drain", "request_shutdown",
+    "MAX_FRAME_SIZE", "CHUNK_HEADER_LEN", "MAX_CHUNK_PAYLOAD",
+    "MAX_CHUNKS", "MAX_MESSAGE_SIZE", "FRAME_FLAG_CHUNK",
+    "__version__",
 ]
-__version__ = "1.4.4"
+__version__ = "1.5.0"
 
 
 # ----- codecs -----
@@ -93,7 +103,7 @@ def _resolve_codec(codec: Any) -> Any:
 # ----- wrappers -----
 
 class Producer:
-    """Push frames to an orchestrator. `with` closes on exit."""
+    """Push messages to an orchestrator. `with` closes on exit."""
 
     __slots__ = ("_inner", "_codec")
 
@@ -106,17 +116,17 @@ class Producer:
         return cls(_Producer.connect(addr), _resolve_codec(codec))
 
     def send(self, obj: Any) -> None:
-        """Encode `obj` with the codec and send it as one frame."""
+        """Encode `obj` with the codec and send it as one message."""
         self._inner.send(self._codec.encode(obj))
 
     def send_bytes(self, data: bytes) -> None:
-        """Bypass the codec; send raw frame bytes regardless of codec."""
+        """Bypass the codec; send raw message bytes regardless of codec."""
         self._inner.send(data)
 
     def close(self) -> None:
         self._inner.close()
 
-    def __enter__(self) -> "Producer":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> bool:
@@ -125,7 +135,10 @@ class Producer:
 
 
 class Consumer:
-    """Pull frames from an orchestrator. Iterable; stops when the connection drops."""
+    """
+    Pull messages from an orchestrator. Iterable; stops when the connection
+    drops.
+    """
 
     __slots__ = ("_inner", "_codec")
 
@@ -138,24 +151,40 @@ class Consumer:
         return cls(_Consumer.connect(addr), _resolve_codec(codec))
 
     def recv(self) -> Any:
-        """Receive one frame and decode it with the codec."""
+        """Receive one complete message and decode it with the codec."""
         return self._codec.decode(self._inner.recv())
 
     def recv_bytes(self) -> bytes:
-        """Bypass the codec; return the raw frame bytes."""
+        """Bypass the codec; return the raw message bytes."""
         return self._inner.recv()
+
+    def gc_partials(self, idle_secs: float) -> int:
+        """Discard partial multi-frame messages that haven't received a chunk
+        for at least `idle_secs` seconds. Returns how many were discarded.
+
+        Partials are orphaned when a producer dies mid-message (or the
+        orchestrator expires a stale message); they cost memory until
+        dropped. Call this on whatever cadence suits your latency
+        expectations, e.g. every few hundred recvs or when the app idles.
+        """
+        return self._inner.gc_partials(idle_secs)
+
+    def pending_partials(self) -> tuple[int, int]:
+        """(message count, buffered bytes) of incomplete multi-frame
+        messages currently held for reassembly."""
+        return self._inner.pending_partials()
 
     def close(self) -> None:
         self._inner.close()
 
-    def __enter__(self) -> "Consumer":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> bool:
         self.close()
         return False
 
-    def __iter__(self) -> "Consumer":
+    def __iter__(self) -> Self:
         return self
 
     def __next__(self) -> Any:

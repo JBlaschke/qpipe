@@ -3,10 +3,19 @@
 // PyO3 bindings for qpipe. Exposes Producer and Consumer as Python classes
 // with context-manager + iterator support. Releases the GIL around all
 // blocking network I/O so other Python threads can run.
+//
+// Multi-frame messages are transparent here exactly as in the Rust API:
+// send() chunks payloads > MAX_FRAME_SIZE, recv() reassembles and returns
+// complete messages in completion order. Consumer additionally exposes
+// gc_partials()/pending_partials() to manage partial messages orphaned by
+// producer/orchestrator failures, and the module exports the framing
+// constants so Python code never hardcodes them.
 use std::time::Duration;
 
 use pyo3::create_exception;
-use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopIteration};
+use pyo3::exceptions::{
+    PyConnectionError, PyRuntimeError, PyStopIteration, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -37,7 +46,8 @@ impl Producer {
         Ok(Producer { inner: Some(inner) })
     }
 
-    /// Send one frame. Blocks until the orchestrator ACKs receipt.
+    /// Send one message. Blocks until the orchestrator ACKs receipt (every
+    /// frame of a chunked message, for payloads larger than MAX_FRAME_SIZE).
     /// Accepts bytes, bytearray, or memoryview.
     fn send(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
         // Copy out of Python memory before releasing the GIL — &[u8] from
@@ -97,7 +107,9 @@ impl Consumer {
         Ok(Consumer { inner: Some(inner) })
     }
 
-    /// Receive one frame. Blocks until a frame is available. Returns `bytes`.
+    /// Receive one complete message. Blocks until one is available; chunks
+    /// of multi-frame messages are buffered internally, so messages are
+    /// returned in COMPLETION order. Returns `bytes`.
     fn recv<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let inner = self
             .inner
@@ -107,6 +119,32 @@ impl Consumer {
             .detach(|| inner.recv())
             .map_err(|e| QpipeError::new_err(format!("recv failed: {e}")))?;
         Ok(PyBytes::new(py, &data))
+    }
+
+    /// Discard partial multi-frame messages that haven't received a chunk
+    /// for at least `idle_secs` seconds. Returns how many were discarded.
+    /// Partials are orphaned when a producer dies mid-message (or the
+    /// orchestrator expires a stale message); they cost memory until dropped.
+    fn gc_partials(&mut self, idle_secs: f64) -> PyResult<usize> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("consumer is closed"))?;
+        // try_from_secs_f64 rejects negative / NaN / overflow as an Err
+        // instead of panicking across the FFI boundary.
+        let idle = Duration::try_from_secs_f64(idle_secs)
+            .map_err(|e| PyValueError::new_err(format!("invalid idle_secs: {e}")))?;
+        Ok(inner.gc_partials(idle))
+    }
+
+    /// (message count, buffered bytes) of incomplete multi-frame messages
+    /// currently held for reassembly.
+    fn pending_partials(&self) -> PyResult<(usize, usize)> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("consumer is closed"))?;
+        Ok(inner.pending_partials())
     }
 
     fn close(&mut self) {
@@ -154,7 +192,6 @@ impl Consumer {
 }
 
 // ---------- orchestrator control ----------
-// (add `use std::time::Duration;` to the imports)
 
 /// Liveness probe: Ok(()) iff an orchestrator answers at `addr`.
 #[pyfunction]
@@ -204,5 +241,13 @@ fn _qpipe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wait_until_healthy, m)?)?;
     m.add_function(wrap_pyfunction!(request_drain, m)?)?;
     m.add_function(wrap_pyfunction!(request_shutdown, m)?)?;
+    // Framing constants (mirror qpipe's Rust consts) so Python code — tests,
+    // payload size pre-checks — never hardcodes them.
+    m.add("MAX_FRAME_SIZE", qpipe::MAX_FRAME_SIZE)?;
+    m.add("CHUNK_HEADER_LEN", qpipe::CHUNK_HEADER_LEN)?;
+    m.add("MAX_CHUNK_PAYLOAD", qpipe::MAX_CHUNK_PAYLOAD)?;
+    m.add("MAX_CHUNKS", qpipe::MAX_CHUNKS)?;
+    m.add("MAX_MESSAGE_SIZE", qpipe::MAX_MESSAGE_SIZE)?;
+    m.add("FRAME_FLAG_CHUNK", qpipe::FRAME_FLAG_CHUNK)?;
     Ok(())
 }
