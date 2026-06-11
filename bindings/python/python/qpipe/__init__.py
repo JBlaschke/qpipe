@@ -38,7 +38,7 @@ __all__ = [
     "MAX_CHUNKS", "MAX_MESSAGE_SIZE", "FRAME_FLAG_CHUNK",
     "__version__",
 ]
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 
 # ----- codecs -----
