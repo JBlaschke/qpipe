@@ -1939,9 +1939,23 @@ impl DateTimePrinter {
     pub fn print_time_zone<W: Write>(
         &self,
         tz: &TimeZone,
-        wtr: W,
+        mut wtr: W,
     ) -> Result<(), Error> {
-        self.p.print_time_zone(tz, wtr)
+        self.p.print_time_zone(tz, &mut wtr)
+    }
+
+    /// Prints a POSIX time zone string.
+    ///
+    /// This isn't exported because `PosixTimeZone` isn't exported. It
+    /// probably never will be, but this is used by tests in the POSIX time
+    /// zone parser to ensure our printing round-trips correctly. It is also
+    /// used by way of the internal `Display` impl for `PosixTimeZone`.
+    pub(crate) fn print_posix_time_zone<W: Write>(
+        &self,
+        tz: &jcore::tz::posix::TimeZone,
+        mut wtr: W,
+    ) -> Result<(), Error> {
+        self.p.print_posix_time_zone(tz, &mut wtr)
     }
 
     /// Print the `Pieces` of a Temporal datetime.
@@ -1973,9 +1987,9 @@ impl DateTimePrinter {
     pub fn print_pieces<W: Write>(
         &self,
         pieces: &Pieces,
-        wtr: W,
+        mut wtr: W,
     ) -> Result<(), Error> {
-        self.p.print_pieces(pieces, wtr)
+        self.p.print_pieces(pieces, &mut wtr)
     }
 
     /// Prints an ISO 8601 week date.
@@ -2369,9 +2383,9 @@ impl SpanPrinter {
     pub fn print_span<W: Write>(
         &self,
         span: &Span,
-        wtr: W,
+        mut wtr: W,
     ) -> Result<(), Error> {
-        self.p.print_span(span, wtr)
+        self.p.print_span(span, &mut wtr)
     }
 
     /// Print a `SignedDuration` to the given writer.
@@ -2410,9 +2424,9 @@ impl SpanPrinter {
     pub fn print_duration<W: Write>(
         &self,
         duration: &SignedDuration,
-        wtr: W,
+        mut wtr: W,
     ) -> Result<(), Error> {
-        self.p.print_signed_duration(duration, wtr)
+        self.p.print_signed_duration(duration, &mut wtr)
     }
 
     /// Print a `std::time::Duration` to the given writer.
@@ -2447,9 +2461,9 @@ impl SpanPrinter {
     pub fn print_unsigned_duration<W: Write>(
         &self,
         duration: &core::time::Duration,
-        wtr: W,
+        mut wtr: W,
     ) -> Result<(), Error> {
-        self.p.print_unsigned_duration(duration, wtr)
+        self.p.print_unsigned_duration(duration, &mut wtr)
     }
 }
 
@@ -2475,6 +2489,17 @@ mod tests {
         );
     }
 
+    // Regression test for: https://github.com/BurntSushi/jiff/issues/539
+    #[test]
+    fn err_temporal_datetime_unparsed_input() {
+        insta::assert_snapshot!(
+            DateTimeParser::new()
+                .parse_datetime(b"2026-04-17 19:43 AM")
+                .unwrap_err(),
+            @r###"parsed value '2026-04-17T19:43:00', but unparsed input " AM" remains (expected no unparsed input)"###,
+        );
+    }
+
     #[test]
     fn year_zero() {
         insta::assert_snapshot!(
@@ -2487,7 +2512,7 @@ mod tests {
         );
         insta::assert_snapshot!(
             DateTimeParser::new().parse_date("-000000-01-01").unwrap_err(),
-            @"failed to parse year in date: year zero must be written without a sign or a positive sign, but not a negative sign",
+            @"year zero must be written without a sign or a positive sign, but not a negative sign",
         );
     }
 

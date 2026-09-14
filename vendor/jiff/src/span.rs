@@ -1,5 +1,7 @@
 use core::{cmp::Ordering, time::Duration as UnsignedDuration};
 
+use jcore::{bounds::Sign, constants as c};
+
 use crate::{
     civil::{Date, DateTime, Time},
     duration::{Duration, SDuration},
@@ -704,7 +706,7 @@ pub(crate) use span_eq;
 /// ```
 #[derive(Clone, Copy, Default)]
 pub struct Span {
-    sign: b::Sign,
+    sign: Sign,
     units: UnitSet,
     years: i16,
     months: i32,
@@ -1323,7 +1325,7 @@ impl Span {
         if self.is_zero() {
             return self;
         }
-        Span { sign: b::Sign::Positive, ..self }
+        Span { sign: Sign::Positive, ..self }
     }
 
     /// Returns a new span that negates this span.
@@ -1500,7 +1502,7 @@ impl Span {
         } else if rhs == 1 {
             return Ok(self);
         }
-        self.sign = self.sign * b::Sign::from(rhs);
+        self.sign = self.sign * Sign::from(rhs);
         // This can only fail when `rhs == i64::MIN`, which is out of bounds
         // for all possible span units (including nanoseconds).
         let rhs = rhs.checked_abs().ok_or_else(b::SpanMultiple::error)?;
@@ -1681,12 +1683,13 @@ impl Span {
     ///
     /// let span1 = 1.month().days(15);
     /// let span2 = 15.days();
-    /// // 1 month from March 1 is 31 days...
+    /// // March 1 plus 1 month is April 1
+    /// // 1 month from April 1 is 30 days...
     /// assert_eq!(
     ///     span1.checked_add((span2, date(2008, 3, 1)))?,
     ///     2.months().fieldwise(),
     /// );
-    /// // ... but 1 month from April 1 is 30 days!
+    /// // ... but 1 month from May 1 is 31 days!
     /// assert_eq!(
     ///     span1.checked_add((span2, date(2008, 4, 1)))?,
     ///     1.month().days(30).fieldwise(),
@@ -2417,22 +2420,23 @@ impl Span {
         // that fits into a `i64`. This in turn implies that a `SignedDuration`
         // can represent all possible invariant positive spans.
         const _FITS_IN_U64: () = {
-            debug_assert!(
+            assert!(
                 i64::MAX as i128
-                    > ((b::SpanWeeks::MAX as i128 * b::SECS_PER_WEEK as i128)
+                    > ((b::SpanWeeks::MAX as i128
+                        * c::SECS_PER_CIVIL_WEEK as i128)
                         + (b::SpanDays::MAX as i128
-                            * b::SECS_PER_CIVIL_DAY as i128)
+                            * c::SECS_PER_CIVIL_DAY as i128)
                         + (b::SpanHours::MAX as i128
-                            * b::SECS_PER_HOUR as i128)
+                            * c::SECS_PER_HOUR as i128)
                         + (b::SpanMinutes::MAX as i128
-                            * b::SECS_PER_MIN as i128)
+                            * c::SECS_PER_MIN as i128)
                         + b::SpanSeconds::MAX as i128
                         + (b::SpanMilliseconds::MAX as i128
-                            / b::MILLIS_PER_SEC as i128)
+                            / c::MILLIS_PER_SEC as i128)
                         + (b::SpanMicroseconds::MAX as i128
-                            / b::MICROS_PER_SEC as i128)
+                            / c::MICROS_PER_SEC as i128)
                         + (b::SpanNanoseconds::MAX as i128
-                            / b::NANOS_PER_SEC as i128)),
+                            / c::NANOS_PER_SEC as i128)),
             );
             ()
         };
@@ -2461,16 +2465,16 @@ impl Span {
         const _FITS_IN_U64: () = {
             debug_assert!(
                 i64::MAX as i128
-                    > ((b::SpanHours::MAX as i128 * b::SECS_PER_HOUR as i128)
+                    > ((b::SpanHours::MAX as i128 * c::SECS_PER_HOUR as i128)
                         + (b::SpanMinutes::MAX as i128
-                            * b::SECS_PER_MIN as i128)
+                            * c::SECS_PER_MIN as i128)
                         + b::SpanSeconds::MAX as i128
                         + (b::SpanMilliseconds::MAX as i128
-                            / b::MILLIS_PER_SEC as i128)
+                            / c::MILLIS_PER_SEC as i128)
                         + (b::SpanMicroseconds::MAX as i128
-                            / b::MICROS_PER_SEC as i128)
+                            / c::MICROS_PER_SEC as i128)
                         + (b::SpanNanoseconds::MAX as i128
-                            / b::NANOS_PER_SEC as i128)),
+                            / c::NANOS_PER_SEC as i128)),
             );
             ()
         };
@@ -2555,7 +2559,7 @@ impl Span {
     }
 
     #[inline]
-    fn get_sign(&self) -> b::Sign {
+    fn get_sign(&self) -> Sign {
         self.sign
     }
 
@@ -2653,7 +2657,7 @@ impl Span {
     }
 
     #[inline]
-    pub(crate) fn sign_unchecked(self, sign: b::Sign) -> Span {
+    pub(crate) fn sign_unchecked(self, sign: Sign) -> Span {
         Span { sign, ..self }
     }
 }
@@ -2734,8 +2738,8 @@ impl Span {
         // This can never overflow because the maximal values for hours,
         // minutes and seconds (even when combined) can fit into an `i64`.
         let mut secs = self.seconds;
-        secs += self.minutes * b::SECS_PER_MIN;
-        secs += i64::from(self.hours) * b::SECS_PER_HOUR;
+        secs += self.minutes * c::SECS_PER_MIN;
+        secs += i64::from(self.hours) * c::SECS_PER_HOUR;
         self.sign * secs
     }
 
@@ -2767,7 +2771,7 @@ impl Span {
             && self.weeks == 0
             && self.days == 0
         {
-            self.sign = b::Sign::Zero;
+            self.sign = Sign::Zero;
         }
         self.units = self.units.only_calendar();
         self
@@ -2789,7 +2793,7 @@ impl Span {
             && self.microseconds == 0
             && self.nanoseconds == 0
         {
-            self.sign = b::Sign::Zero;
+            self.sign = Sign::Zero;
         }
         self.units = self.units.only_time();
         self
@@ -2952,11 +2956,11 @@ impl Span {
     /// Given some new units to set on this span and the span updates with the
     /// new units, this determines the what the sign of `new` should be.
     #[inline]
-    fn resign(&self, units: impl Into<i64>, new: &Span) -> b::Sign {
-        fn imp(span: &Span, units: i64, new: &Span) -> b::Sign {
+    fn resign(&self, units: impl Into<i64>, new: &Span) -> Sign {
+        fn imp(span: &Span, units: i64, new: &Span) -> Sign {
             // Negative units anywhere always makes the entire span negative.
             if units.is_negative() {
-                return b::Sign::Negative;
+                return Sign::Negative;
             }
             let mut new_is_zero = new.sign.is_zero() && units == 0;
             // When `units == 0` and it was previously non-zero, then
@@ -2976,8 +2980,8 @@ impl Span {
                     && new.nanoseconds == 0;
             }
             match (span.is_zero(), new_is_zero) {
-                (_, true) => b::Sign::Zero,
-                (true, false) => b::Sign::from(units),
+                (_, true) => Sign::Zero,
+                (true, false) => Sign::from(units),
                 // If the old and new span are both non-zero, and we know our
                 // new units are not negative, then the sign remains unchanged.
                 (false, false) => new.sign,
@@ -3304,10 +3308,10 @@ impl TryFrom<SignedDuration> for Span {
     fn try_from(d: SignedDuration) -> Result<Span, Error> {
         let seconds = d.as_secs();
         let nanoseconds = i64::from(d.subsec_nanos());
-        let milliseconds = nanoseconds / b::NANOS_PER_MILLI;
+        let milliseconds = nanoseconds / c::NANOS_PER_MILLI;
         let microseconds =
-            (nanoseconds % b::NANOS_PER_MILLI) / b::NANOS_PER_MICRO;
-        let nanoseconds = nanoseconds % b::NANOS_PER_MICRO;
+            (nanoseconds % c::NANOS_PER_MILLI) / c::NANOS_PER_MICRO;
+        let nanoseconds = nanoseconds % c::NANOS_PER_MICRO;
 
         let span = Span::new().try_seconds(seconds)?;
         // These are all OK because `|SignedDuration::subsec_nanos|` is
@@ -3318,6 +3322,17 @@ impl TryFrom<SignedDuration> for Span {
             .milliseconds(milliseconds)
             .microseconds(microseconds)
             .nanoseconds(nanoseconds))
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Span {
+    fn format(&self, f: defmt::Formatter) {
+        use crate::fmt::DefmtWrite;
+
+        defmt::unwrap!(
+            friendly::DEFAULT_SPAN_PRINTER.print_span(self, DefmtWrite(f))
+        );
     }
 }
 
@@ -3495,6 +3510,7 @@ impl quickcheck::Arbitrary for Span {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(transparent)]
 pub struct SpanFieldwise(pub Span);
 
@@ -3856,6 +3872,7 @@ impl_to_span!(i64);
 /// assert_eq!(Unit::Hour, Unit::Hour);
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Unit {
     /// A Gregorian calendar year. It usually has 365 days for non-leap years,
     /// and 366 days for leap years.
@@ -5629,7 +5646,7 @@ impl core::fmt::Debug for UnitSet {
             }
             i += 1;
             write!(f, "{}", unit.compact())?;
-            units = units.set(unit, false);
+            units = units.set(unit, true);
         }
         if i == 0 {
             write!(f, "∅")?;
@@ -6158,7 +6175,7 @@ impl Nudge {
         let diff_nanos = rounded_nanos - balanced_nanos;
         let diff_days =
             rounded_nanos.as_civil_days() - balanced_nanos.as_civil_days();
-        let grew_big_unit = b::Sign::from(diff_days) == sign;
+        let grew_big_unit = Sign::from(diff_days) == sign;
         let rounded_relative_end = relative_end + diff_nanos;
         Ok(Nudge { span, rounded_relative_end, grew_big_unit })
     }
@@ -6276,8 +6293,7 @@ impl Nudge {
             mode.round_by_duration(progress_nanos, increment_nanos)?;
         // If we rounded up, then it's possible we might need to to re-balance
         // our span. (This happens in `bubble`.)
-        let grew_big_unit =
-            sign == b::Sign::from(rounded_nanos - progress_nanos);
+        let grew_big_unit = sign == (rounded_nanos - progress_nanos).sign();
         // These asserts check an assumption that, since we're dealing with
         // calendar units, and because time zone transitions never have
         // precision less than 1 second, it follows that the *length* of
@@ -6333,7 +6349,7 @@ impl Nudge {
 
         let mut day_delta = 0;
         let rounded_relative_end = if beyond_day_nanos.is_zero()
-            || b::Sign::from(beyond_day_nanos) == sign
+            || beyond_day_nanos.sign() == sign
         {
             day_delta += 1;
             rounded_time_nanos = increment.round(mode, beyond_day_nanos)?;
@@ -6402,7 +6418,7 @@ impl Nudge {
             };
             // If we overshoot our expected endpoint, then bail.
             let beyond = self.rounded_relative_end - threshold.as_duration();
-            if beyond.is_zero() || b::Sign::from(beyond) == sign {
+            if beyond.is_zero() || beyond.sign() == sign {
                 balanced = span_end;
             } else {
                 break;
@@ -6869,18 +6885,18 @@ mod tests {
 
     #[test]
     fn span_sign() {
-        assert_eq!(Span::new().get_sign(), b::Sign::Zero);
-        assert_eq!(Span::new().days(1).get_sign(), b::Sign::Positive);
-        assert_eq!(Span::new().days(-1).get_sign(), b::Sign::Negative);
-        assert_eq!(Span::new().days(1).days(0).get_sign(), b::Sign::Zero);
-        assert_eq!(Span::new().days(-1).days(0).get_sign(), b::Sign::Zero);
+        assert_eq!(Span::new().get_sign(), Sign::Zero);
+        assert_eq!(Span::new().days(1).get_sign(), Sign::Positive);
+        assert_eq!(Span::new().days(-1).get_sign(), Sign::Negative);
+        assert_eq!(Span::new().days(1).days(0).get_sign(), Sign::Zero);
+        assert_eq!(Span::new().days(-1).days(0).get_sign(), Sign::Zero);
         assert_eq!(
             Span::new().years(1).days(1).days(0).get_sign(),
-            b::Sign::Positive,
+            Sign::Positive,
         );
         assert_eq!(
             Span::new().years(-1).days(-1).days(0).get_sign(),
-            b::Sign::Negative,
+            Sign::Negative,
         );
     }
 
@@ -7182,5 +7198,11 @@ mod tests {
                 709_551_614,
             ),
         );
+    }
+
+    #[test]
+    fn unit_set_debug() {
+        let set = UnitSet::from_slice(&[Unit::Second]);
+        assert_eq!(std::format!("{set:?}"), "{s}");
     }
 }

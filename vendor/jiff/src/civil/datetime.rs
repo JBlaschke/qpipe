@@ -1,5 +1,7 @@
 use core::time::Duration as UnsignedDuration;
 
+use jcore::{bounds::Sign, civil::DateTime as JDateTime, constants as c};
+
 use crate::{
     civil::{
         datetime, Date, DateWith, Era, ISOWeekDate, Time, TimeWith, Weekday,
@@ -10,9 +12,8 @@ use crate::{
         self,
         temporal::{self, DEFAULT_DATETIME_PARSER},
     },
-    shared::util::itime::IDateTime,
     tz::TimeZone,
-    util::{b, round::Increment},
+    util::round::Increment,
     zoned::Zoned,
     RoundMode, SignedDuration, Span, SpanRound, Unit,
 };
@@ -213,6 +214,7 @@ use crate::{
 ///
 /// See [`DateTime::round`] for more details.
 #[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct DateTime {
     date: Date,
     time: Time,
@@ -1565,7 +1567,7 @@ impl DateTime {
                 (offset, ts, dt)
             }
         };
-        Ok(Zoned::from_parts(ts, tz, offset, dt))
+        Ok(Zoned::from_parts(ts, dt, offset, tz))
     }
 
     /// Add the given span of time to this datetime. If the sum would overflow
@@ -2364,26 +2366,24 @@ impl DateTime {
     /// zone offset and where all days are exactly 24 hours long.
     #[inline]
     fn to_duration(self) -> SignedDuration {
-        let mut dur =
-            SignedDuration::from_civil_days32(self.date().to_unix_epoch_day());
+        let mut dur = SignedDuration::from_civil_days32(
+            self.date().to_unix_epoch_day().day(),
+        );
         dur += self.time().to_duration();
         dur
     }
 
     #[inline]
-    pub(crate) const fn to_idatetime_const(&self) -> IDateTime {
-        IDateTime {
-            date: self.date.to_idate_const(),
-            time: self.time.to_itime_const(),
-        }
+    pub(crate) const fn from_jcore(dt: JDateTime) -> DateTime {
+        DateTime::from_parts(
+            Date::from_jcore(dt.date()),
+            Time::from_jcore(dt.time()),
+        )
     }
 
     #[inline]
-    pub(crate) const fn from_idatetime_const(idt: IDateTime) -> DateTime {
-        DateTime::from_parts(
-            Date::from_idate_const(idt.date),
-            Time::from_itime_const(idt.time),
-        )
+    pub(crate) const fn to_jcore(&self) -> JDateTime {
+        JDateTime::from_parts(self.date.to_jcore(), self.time.to_jcore())
     }
 }
 
@@ -2434,11 +2434,14 @@ impl DateTime {
     ///
     /// # Errors and panics
     ///
-    /// While this routine itself does not error or panic, using the value
-    /// returned may result in a panic if formatting fails. See the
-    /// documentation on [`fmt::strtime::Display`] for more information.
+    /// This will never error or panic. In particular,
+    /// [lenient mode](crate::fmt::strtime::Config::lenient) is enabled, which
+    /// means that all possible strings have some non-error interpretation.
+    /// Note that because of this, and since Jiff may add new conversion
+    /// specifiers in the future, the behavior of a format string may change
+    /// when it would otherwise be invalid.
     ///
-    /// To format in a way that surfaces errors without panicking, use either
+    /// To format in a way that surfaces errors, use either
     /// [`fmt::strtime::format`] or [`fmt::strtime::BrokenDownTime::format`].
     ///
     /// # Example
@@ -2451,6 +2454,33 @@ impl DateTime {
     /// let dt = date(2024, 7, 15).at(16, 24, 59, 0);
     /// let string = dt.strftime("%A, %B %e, %Y at %H:%M:%S").to_string();
     /// assert_eq!(string, "Monday, July 15, 2024 at 16:24:59");
+    /// ```
+    ///
+    /// # Example: errors are silently ignored
+    ///
+    /// If the formatting string is malformed in some way, then it is silently
+    /// ignored. For example, when using an invalid formatting directive:
+    ///
+    /// ```
+    /// use jiff::civil::date;
+    ///
+    /// let dt = date(2024, 7, 15).at(16, 24, 59, 0);
+    /// let string = dt.strftime("%Y %").to_string();
+    /// assert_eq!(string, "2024 %");
+    /// ```
+    ///
+    /// If one wants to surface errors from a formatting string, use a lower
+    /// level API:
+    ///
+    /// ```
+    /// use jiff::civil::date;
+    ///
+    /// let dt = date(2024, 7, 15).at(16, 24, 59, 0);
+    /// assert_eq!(
+    ///     jiff::fmt::strtime::format("%Y %", dt).unwrap_err().to_string(),
+    ///     "strftime formatting failed: invalid format string, \
+    ///      expected byte after `%`, but found end of format string",
+    /// );
     /// ```
     #[inline]
     pub fn strftime<'f, F: 'f + ?Sized + AsRef<[u8]>>(
@@ -2757,6 +2787,17 @@ impl core::ops::SubAssign<UnsignedDuration> for DateTime {
     #[inline]
     fn sub_assign(&mut self, rhs: UnsignedDuration) {
         *self = *self - rhs
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for DateTime {
+    fn format(&self, f: defmt::Formatter) {
+        use crate::fmt::{temporal::DEFAULT_DATETIME_PRINTER, DefmtWrite};
+
+        defmt::unwrap!(
+            DEFAULT_DATETIME_PRINTER.print_datetime(self, DefmtWrite(f))
+        );
     }
 }
 
@@ -3244,9 +3285,9 @@ impl DateTimeDifference {
 
         let (d1, mut d2) = (dt1.date(), dt2.date());
         let (t1, t2) = (dt1.time(), dt2.time());
-        let sign = b::Sign::from_ordinals(d2, d1);
+        let sign = Sign::from_ordinals(d2, d1);
         let mut time_diff = t1.until_nanoseconds(t2);
-        if b::Sign::from(time_diff) == -sign {
+        if Sign::from(time_diff) == -sign {
             // These unwraps will always succeed, but the argument for why is
             // subtle. The key here is that the only way, e.g., d2.tomorrow()
             // can fail is when d2 is the max date. But, if d2 is the max date,
@@ -3258,7 +3299,7 @@ impl DateTimeDifference {
             } else if sign.is_negative() {
                 d2 = d2.tomorrow().unwrap();
             }
-            time_diff += b::NANOS_PER_CIVIL_DAY * sign;
+            time_diff += c::NANOS_PER_CIVIL_DAY * sign;
         }
         let date_span = d1.until((largest, d2))?;
         // Unlike in the <=Unit::Day case, this always succeeds because
@@ -3537,7 +3578,7 @@ impl DateTimeRound {
         let increment =
             Increment::for_datetime(self.smallest, self.increment)?;
         let time_nanos = dt.time().to_duration();
-        let sign = b::Sign::from(dt.date().year());
+        let sign = Sign::from(dt.date().year());
         let time_rounded = increment.round(self.mode, time_nanos)?;
         let (days, time_nanos) = time_rounded.as_civil_days_with_remainder();
         // OK because `abs(days)` here can never be greater than 1. Namely,
@@ -3546,7 +3587,9 @@ impl DateTimeRound {
         // limited to `1`. So even starting with the maximal `dt.time()` value
         // (the last nanosecond in a civil day), we can never round past 1 day.
         let days = sign * days;
-        let time = Time::from_duration_unchecked(time_nanos);
+        // OK because `time_nanos` is guaranteed to be less than a single full
+        // civil day.
+        let time = Time::from_duration(time_nanos).unwrap();
 
         // OK because `abs(days) <= 1` (see above comment) and
         // `dt.date().day()` can never exceed `31`. So the result always fits

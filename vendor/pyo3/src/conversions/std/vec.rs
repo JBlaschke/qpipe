@@ -1,5 +1,6 @@
-#[cfg(feature = "experimental-inspect")]
-use crate::inspect::types::TypeInfo;
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_subscript, PyStaticExpr};
 use crate::{
@@ -30,11 +31,6 @@ where
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         T::owned_sequence_into_pyobject(self, py, crate::conversion::private::Token)
     }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::list_of(T::type_output())
-    }
 }
 
 impl<'a, 'py, T> IntoPyObject<'py> for &'a Vec<T>
@@ -54,11 +50,6 @@ where
         // `&Vec<u8>`, but that'd be inconsistent with the `IntoPyObject` impl
         // above which always returns a `PyAny` for `Vec<T>`.
         self.as_slice().into_pyobject(py).map(Bound::into_any)
-    }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::list_of(<&T>::type_output())
     }
 }
 
@@ -82,11 +73,6 @@ where
 
         extract_sequence(obj)
     }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_input() -> TypeInfo {
-        TypeInfo::sequence_of(T::type_input())
-    }
 }
 
 fn extract_sequence<'py, T>(obj: Borrowed<'_, 'py, PyAny>) -> PyResult<Vec<T>>
@@ -95,16 +81,12 @@ where
 {
     // Types that pass `PySequence_Check` usually implement enough of the sequence protocol
     // to support this function and if not, we will only fail extraction safely.
-    let seq = unsafe {
-        if ffi::PySequence_Check(obj.as_ptr()) != 0 {
-            obj.cast_unchecked::<PySequence>()
-        } else {
-            return Err(CastError::new(obj, PySequence::type_object(obj.py()).into_any()).into());
-        }
-    };
+    if unsafe { ffi::PySequence_Check(obj.as_ptr()) } == 0 {
+        return Err(CastError::new(obj, PySequence::type_object(obj.py()).into_any()).into());
+    }
 
-    let mut v = Vec::with_capacity(seq.len().unwrap_or(0));
-    for item in seq.try_iter()? {
+    let mut v = Vec::with_capacity(obj.len().unwrap_or(0));
+    for item in obj.try_iter()? {
         v.push(item?.extract::<T>().map_err(Into::into)?);
     }
     Ok(v)

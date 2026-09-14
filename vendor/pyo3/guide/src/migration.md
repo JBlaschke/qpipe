@@ -3,11 +3,142 @@
 This guide can help you upgrade code through breaking changes from one PyO3 version to the next.
 For a detailed list of all changes, see the [CHANGELOG](changelog.md).
 
+## from 0.28.* to 0.29
+
+### Removed implementations of `From<str::Utf8Error>`, `From<string::FromUtf16Error>`, and `From<char::DecodeUtf16Error>` for `PyErr`
+
+<details open>
+<summary><small>Click to expand</small></summary>
+
+Previously the implementations of `From<string::FromUtf8Error>`, `From<ffi::IntoStringError>`, `From<str::Utf8Error>`, `From<string::FromUtf16Error>`, and `From<char::DecodeUtf16Error>` failed to construct the correct Python exception class, as reported in <https://github.com/PyO3/pyo3/issues/5651>.
+The implementations for `string::FromUtf8Error` and `ffi::IntoStringError` were fixed in this release.
+
+For `str::Utf8Error`, the Rust error does not contain the source bytes required to construct the Python exception.
+Instead, `PyUnicodeDecodeError::new_err_from_utf8` can be used to convert the error to a `PyErr`.
+
+Before:
+
+```rust,ignore
+fn bytes_to_str(bytes: &[u8]) -> PyResult<&str> {
+    Ok(std::str::from_utf8(bytes)?)
+}
+```
+
+After:
+
+```rust
+# use pyo3::prelude::*;
+use pyo3::exceptions::PyUnicodeDecodeError;
+
+# #[expect(dead_code)]
+fn bytes_to_str<'a>(py: Python<'_>, bytes: &'a [u8]) -> PyResult<&'a str> {
+    std::str::from_utf8(bytes).map_err(|e| PyUnicodeDecodeError::new_err_from_utf8(py, bytes, e))
+}
+```
+
+For `string::FromUtf16Error` and `char::DecodeUtf16Error` the Rust error types do not contain any of the information required to construct a `UnicodeDecodeError`.
+To raise a Python `UnicodeDecodeError` a new error should be manually constructed by calling `PyUnicodeDecodeError::new_err(...)`.
+
+</details>
+
+### `pyo3_build_config` APIs now require a direct dependency on `pyo3` or `pyo3-ffi`
+
+<details open>
+<summary><small>Click to expand</small></summary>
+
+Prior to PyO3 0.29, `pyo3-build-config` would inline part of the build configuration into the crate in its own build script.
+This worked for simple builds but not for cross-compiling; `pyo3-ffi`'s build script would need to re-implement a lot of the same machinery to correctly configure the build for cross-compilation.
+There were also edge cases where `pyo3-build-config` would use this inlined configuration incorrectly and misconfigure the build - e.g. [when cross compiling with `buck` or `bazel` build systems](https://github.com/PyO3/pyo3/issues/4579).
+
+In PyO3 0.29, `pyo3-build-config` no longer inlines any configuration into itself and instead requires a direct dependency on either `pyo3-ffi` or `pyo3` to load the configuration resolved from `pyo3-ffi`'s build script.
+
+This has upside of faster compilation - `pyo3-build-config` no longer has a build script and never recompiles when changing Python version.
+It also guarantees that all builds are based on the single fully-configured build configuration resolved by `pyo3-ffi`.
+
+### Deprecation of super class initialization from tuples
+
+Performing superclass initialitation from a subclass via a tuple is deprecated and will be removed in a future PyO3 version.
+This also includes the `From<(S, B)> for PyClassInitializer<S>` impl which we can't warn against.
+To migrate use `PyClassInitializer` directly:
+
+Before:
+
+```rust
+# #![allow(deprecated)]
+# use pyo3::prelude::*;
+#[pyclass(subclass)]
+struct Base;
+
+#[pyclass(extends=Base)]
+struct Sub;
+
+#[pymethods]
+impl Sub {
+    #[new]
+    fn new() -> (Self, Base) {
+        (Self, Base)
+    }
+}
+```
+
+After:
+
+```rust
+# use pyo3::prelude::*;
+#[pyclass(subclass)]
+struct Base;
+
+#[pyclass(extends=Base)]
+struct Sub;
+
+#[pymethods]
+impl Sub {
+    #[new]
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(Base)
+            .add_subclass(Self)
+    }
+}
+```
+
+</details>
+
+### Minor API breaks for soundness reasons
+
+<details open>
+<summary><small>Click to expand</small></summary>
+
+Recent development in LLM-assisted security analysis has enhanced the ability to detect flaws, both for maintainers and attackers.
+Such security analysis of PyO3 flagged some APIs with edge cases that could lead to unsoundness.
+The PyO3 maintainers took the decision to make small breaking changes to eliminate these edge cases.
+Users should not be affected by these changes unless they were inadvertently relying on unsound behavior.
+
+The changes were:
+
+- `PyCapsule::new_with_destructor` now requires the destructor to be `'static` to prevent possible use-after-free issues.
+- `PyCFunction::new_closure` now requires the closure to be `Sync` to prevent possible thread unsafety. ⚠️ A security advisory will be issued for this, as the thread unsafety could easily go undetected in testing and lead to exploitable issues downstream in production. ⚠️
+- `PyClassGuardMap` has been split into `PyClassGuardMap` and `PyClassGuardMapMut` to prevent possible lifetime variance issues.
+- `PyClassGuardMut::as_super` now returns `PyClassGuardMutSuper` instead of `&mut PyClassGuardMut<SuperType>` to prevent possible type confusion issues.
+- `with_critical_section_mutex2` now passes an `Option<EnteredCriticalSection>` as the second argument to the closure to avoid possible mutable reference aliasing when both mutexes participating in the critical section are the same address.
+
+</details>
+
+### PyO3 now uses `raw-dylib` linking on Windows
+
+<details open>
+<summary><small>Click to expand</small></summary>
+
+The `raw-dylib` linking mode allows PyO3 to no longer need to have link libraries present when building for Windows targets.
+This removes the need for the `generate-import-lib` feature (which is now a no-op) and generally simplifies building for Windows.
+This is not expected to have negative impact on users, please report if there are issues.
+
+</details>
+
 ## from 0.27.* to 0.28
 
 ### Default to supporting free-threaded Python
 
-<details open>
+<details>
 <summary><small>Click to expand</small></summary>
 
 When PyO3 0.23 added support for free-threaded Python, this was as an opt-in feature for modules by annotating with `#[pymodule(gil_used = false)]`.
@@ -18,7 +149,7 @@ Modules now automatically allow use on free-threaded Python, unless they directl
 
 ### Deprecation of automatic `FromPyObject` for `#[pyclass]` types which implement `Clone`
 
-<details open>
+<details>
 <summary><small>Click to expand</small></summary>
 
 `#[pyclass]` types which implement `Clone` used to also implement `FromPyObject` automatically.
@@ -61,7 +192,7 @@ The `#[pyclass(skip_from_py_object)]` option will eventually be deprecated and r
 
 ### Deprecation of `Py<T>` constructors from raw pointer
 
-<details open>
+<details>
 <summary><small>Click to expand</small></summary>
 
 The constructors `Py::from_owned_ptr`, `Py::from_owned_ptr_or_opt`, and `Py::from_owned_ptr_or_err` (and similar "borrowed" variants) perform an unchecked cast to the `Py<T>` target type `T`.
@@ -103,7 +234,7 @@ let _: Bound<'_, PyNone> = unsafe { Bound::from_owned_ptr(py, raw_ptr).cast_into
 
 ### Removal of `From<Bound<'_, T>` and `From<Py<T>> for PyClassInitializer<T>`
 
-<details open>
+<details>
 <summary><small>Click to expand</small></summary>
 
 As part of refactoring the initialization code these impls were removed and its functionality was moved into the generated code for `#[new]`.
@@ -137,17 +268,18 @@ let obj_2 = existing_bound.clone();
 
 ### Untyped buffer API moved to PyUntypedBuffer
 
-<details open>
+<details>
 <summary><small>Click to expand</small></summary>
 
 `PyBuffer<T>` now is a typed wrapper around `PyUntypedBuffer`.
-Many methods such as `PyBuffer::format` have been moved to `PyUntypedBuffer::format`. `PyBuffer<T>` dereferences to `PyUntypedBuffer`, so method call syntax will continue to work as-is.
+Many methods such as `PyBuffer::format` have been moved to `PyUntypedBuffer::format`.
+`PyBuffer<T>` dereferences to `PyUntypedBuffer`, so method call syntax will continue to work as-is.
 Users may need to update references to the moved functions.
 </details>
 
 ### Internal change to use multi-phase initialization
 
-<details open>
+<details>
 <summary><small>Click to expand</small></summary>
 
 [PEP 489](https://peps.python.org/pep-0489/) introduced "multi-phase initialization" for extension modules which provides ways to allocate and clean up per-module state.
@@ -291,7 +423,7 @@ where
 }
 ```
 
-This is very similar to `serde`s [`Deserialize`] and [`DeserializeOwned`] traits, see [here](https://serde.rs/lifetimes.html).
+This is very similar to `serde`s [`Deserialize`] and [`DeserializeOwned`] traits, see [the `serde` docs](https://serde.rs/lifetimes.html).
 
 [`Deserialize`]: https://docs.rs/serde/latest/serde/trait.Deserialize.html
 [`DeserializeOwned`]: https://docs.rs/serde/latest/serde/de/trait.DeserializeOwned.html
@@ -522,9 +654,9 @@ Some features are inaccessible on the free-threaded build:
 - `PyList::get_item_unchecked`, which cannot soundly be used due to races between time-of-check and time-of-use
 
 If you make use of these features then you will need to account for the unavailability of the API in the free-threaded build.
-One way to handle it is via conditional compilation -- extensions can use `pyo3-build-config` to get access to a `#[cfg(Py_GIL_DISABLED)]` guard.
+One way to handle it is via conditional compilation -- extension modules can use `pyo3-build-config` to get access to a `#[cfg(Py_GIL_DISABLED)]` guard.
 
-See [the guide section on free-threaded Python](free-threading.md) for more details about supporting free-threaded Python in your PyO3 extensions.
+See [the guide section on free-threaded Python](free-threading.md) for more details about supporting free-threaded Python in a PyO3 extension module.
 </details>
 
 ### New `IntoPyObject` trait unifies to-Python conversions
@@ -1761,7 +1893,8 @@ PyO3 0.17 changes these downcast checks to explicitly test if the type is a subc
 Note this requires calling into Python, which may incur a performance penalty over the previous method.
 If this performance penalty is a problem, you may be able to perform your own checks and use `try_from_unchecked` (unsafe).
 
-Another side-effect is that a pyclass defined in Rust with PyO3 will need to be _registered_ with the corresponding Python abstract base class for downcasting to succeed. `PySequence::register` and `PyMapping:register` have been added to make it easy to do this from Rust code.
+Another side-effect is that a pyclass defined in Rust with PyO3 will need to be _registered_ with the corresponding Python abstract base class for downcasting to succeed.
+`PySequence::register` and `PyMapping:register` have been added to make it easy to do this from Rust code.
 These are equivalent to calling `collections.abc.Mapping.register(MappingPyClass)` or `collections.abc.Sequence.register(SequencePyClass)` from Python.
 
 For example, for a mapping class defined in Rust:
@@ -2283,7 +2416,8 @@ let result: PyResult<()> = Err(PyTypeError::new_err("error message"));
 <summary><small>Click to expand</small></summary>
 
 Previously exception types were zero-sized marker types purely used to construct `PyErr`.
-In PyO3 0.12, these types have been replaced with full definitions and are usable in the same way as `PyAny`, `PyDict` etc. This makes it possible to interact with Python exception objects.
+In PyO3 0.12, these types have been replaced with full definitions and are usable in the same way as `PyAny`, `PyDict` etc.
+This makes it possible to interact with Python exception objects.
 
 The new types also have names starting with the "Py" prefix.
 For example, before:
@@ -2522,7 +2656,7 @@ py.None().get_refcnt();
 
 After:
 
-```rust
+```rust,ignore
 # pyo3::Python::attach(|py| {
 py.None().get_refcnt(py);
 # })

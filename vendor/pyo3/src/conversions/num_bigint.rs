@@ -1,3 +1,5 @@
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
 #![cfg(feature = "num-bigint")]
 //!  Conversions to and from [num-bigint](https://docs.rs/num-bigint)’s [`BigInt`] and [`BigUint`] types.
 //!
@@ -56,6 +58,10 @@ use crate::{
 
 use num_bigint::{BigInt, BigUint};
 
+#[cfg(feature = "experimental-inspect")]
+use crate::inspect::PyStaticExpr;
+#[cfg(feature = "experimental-inspect")]
+use crate::PyTypeInfo;
 #[cfg(not(Py_LIMITED_API))]
 use num_bigint::Sign;
 
@@ -68,6 +74,9 @@ macro_rules! bigint_conversion {
             type Output = Bound<'py, Self::Target>;
             type Error = PyErr;
 
+            #[cfg(feature = "experimental-inspect")]
+            const OUTPUT_TYPE: PyStaticExpr = <&$rust_ty>::OUTPUT_TYPE;
+
             #[inline]
             fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
                 (&self).into_pyobject(py)
@@ -79,6 +88,9 @@ macro_rules! bigint_conversion {
             type Target = PyInt;
             type Output = Bound<'py, Self::Target>;
             type Error = PyErr;
+
+            #[cfg(feature = "experimental-inspect")]
+            const OUTPUT_TYPE: PyStaticExpr = PyInt::TYPE_HINT;
 
             fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
                 use num_traits::ToBytes;
@@ -128,6 +140,9 @@ bigint_conversion!(BigInt, true);
 impl<'py> FromPyObject<'_, 'py> for BigInt {
     type Error = PyErr;
 
+    #[cfg(feature = "experimental-inspect")]
+    const INPUT_TYPE: PyStaticExpr = PyInt::TYPE_HINT;
+
     fn extract(ob: Borrowed<'_, 'py, PyAny>) -> Result<BigInt, Self::Error> {
         // fast path - checking for subclass of `int` just checks a bit in the type object
         let num_owned: Bound<'_, PyInt>;
@@ -176,6 +191,9 @@ impl<'py> FromPyObject<'_, 'py> for BigInt {
 #[cfg_attr(docsrs, doc(cfg(feature = "num-bigint")))]
 impl<'py> FromPyObject<'_, 'py> for BigUint {
     type Error = PyErr;
+
+    #[cfg(feature = "experimental-inspect")]
+    const INPUT_TYPE: PyStaticExpr = PyInt::TYPE_HINT;
 
     fn extract(ob: Borrowed<'_, 'py, PyAny>) -> Result<BigUint, Self::Error> {
         // fast path - checking for subclass of `int` just checks a bit in the type object
@@ -250,7 +268,7 @@ fn int_to_u32_vec<const SIGNED: bool>(long: &Bound<'_, PyInt>) -> PyResult<Vec<u
         flags |= ffi::Py_ASNATIVEBYTES_UNSIGNED_BUFFER | ffi::Py_ASNATIVEBYTES_REJECT_NEGATIVE;
     }
     let n_bytes =
-        unsafe { ffi::PyLong_AsNativeBytes(long.as_ptr().cast(), std::ptr::null_mut(), 0, flags) };
+        unsafe { ffi::PyLong_AsNativeBytes(long.as_ptr().cast(), core::ptr::null_mut(), 0, flags) };
     let n_bytes_unsigned: usize = n_bytes
         .try_into()
         .map_err(|_| crate::PyErr::fetch(long.py()))?;
@@ -302,24 +320,9 @@ fn int_to_py_bytes<'py>(
 #[inline]
 #[cfg(any(not(Py_3_13), Py_LIMITED_API))]
 fn int_n_bits(long: &Bound<'_, PyInt>) -> PyResult<usize> {
-    let py = long.py();
-    #[cfg(not(Py_LIMITED_API))]
-    {
-        // fast path
-        let n_bits = unsafe { crate::ffi::_PyLong_NumBits(long.as_ptr()) };
-        if n_bits == (-1isize as usize) {
-            return Err(crate::PyErr::fetch(py));
-        }
-        Ok(n_bits)
-    }
-
-    #[cfg(Py_LIMITED_API)]
-    {
-        // slow path
-        use crate::types::PyAnyMethods;
-        long.call_method0(crate::intern!(py, "bit_length"))
-            .and_then(|any| any.extract())
-    }
+    use crate::types::PyAnyMethods;
+    long.call_method0(crate::intern!(long.py(), "bit_length"))
+        .and_then(|any| any.extract())
 }
 
 #[cfg(test)]
@@ -333,22 +336,22 @@ mod tests {
     fn rust_fib<T>() -> impl Iterator<Item = T>
     where
         T: From<u16>,
-        for<'a> &'a T: std::ops::Add<Output = T>,
+        for<'a> &'a T: core::ops::Add<Output = T>,
     {
         let mut f0: T = T::from(1);
         let mut f1: T = T::from(1);
-        std::iter::from_fn(move || {
+        core::iter::from_fn(move || {
             let f2 = &f0 + &f1;
-            Some(std::mem::replace(&mut f0, std::mem::replace(&mut f1, f2)))
+            Some(core::mem::replace(&mut f0, core::mem::replace(&mut f1, f2)))
         })
     }
 
     fn python_fib(py: Python<'_>) -> impl Iterator<Item = Bound<'_, PyAny>> + '_ {
         let mut f0 = 1i32.into_pyobject(py).unwrap().into_any();
         let mut f1 = 1i32.into_pyobject(py).unwrap().into_any();
-        std::iter::from_fn(move || {
+        core::iter::from_fn(move || {
             let f2 = f0.call_method1("__add__", (&f1,)).unwrap();
-            Some(std::mem::replace(&mut f0, std::mem::replace(&mut f1, f2)))
+            Some(core::mem::replace(&mut f0, core::mem::replace(&mut f1, f2)))
         })
     }
 

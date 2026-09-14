@@ -13,9 +13,10 @@
 edition = "2021"
 rust-version = "1.83"
 name = "pyo3"
-version = "0.28.3"
+version = "0.29.2"
 authors = ["PyO3 Project and Contributors <https://github.com/PyO3>"]
 build = "build.rs"
+links = "pyo3-python"
 exclude = [
     "/.gitignore",
     ".cargo/config",
@@ -58,49 +59,43 @@ rustdoc-args = [
 ]
 
 [features]
-abi3 = [
-    "pyo3-build-config/abi3",
-    "pyo3-ffi/abi3",
-]
+abi3 = ["pyo3-ffi/abi3"]
 abi3-py310 = [
     "abi3-py311",
-    "pyo3-build-config/abi3-py310",
     "pyo3-ffi/abi3-py310",
 ]
 abi3-py311 = [
     "abi3-py312",
-    "pyo3-build-config/abi3-py311",
     "pyo3-ffi/abi3-py311",
 ]
 abi3-py312 = [
     "abi3-py313",
-    "pyo3-build-config/abi3-py312",
     "pyo3-ffi/abi3-py312",
 ]
 abi3-py313 = [
     "abi3-py314",
-    "pyo3-build-config/abi3-py313",
     "pyo3-ffi/abi3-py313",
 ]
 abi3-py314 = [
-    "abi3",
-    "pyo3-build-config/abi3-py314",
+    "abi3-py315",
     "pyo3-ffi/abi3-py314",
 ]
-abi3-py37 = [
-    "abi3-py38",
-    "pyo3-build-config/abi3-py37",
-    "pyo3-ffi/abi3-py37",
+abi3-py315 = [
+    "abi3",
+    "pyo3-ffi/abi3-py315",
 ]
 abi3-py38 = [
     "abi3-py39",
-    "pyo3-build-config/abi3-py38",
     "pyo3-ffi/abi3-py38",
 ]
 abi3-py39 = [
     "abi3-py310",
-    "pyo3-build-config/abi3-py39",
     "pyo3-ffi/abi3-py39",
+]
+abi3t = ["pyo3-ffi/abi3t"]
+abi3t-py315 = [
+    "abi3t",
+    "pyo3-ffi/abi3t-py315",
 ]
 arc_lock = [
     "lock_api",
@@ -176,58 +171,72 @@ path = "src/lib.rs"
 [[test]]
 name = "test_anyhow"
 path = "tests/test_anyhow.rs"
+required-features = ["anyhow"]
 
 [[test]]
 name = "test_append_to_inittab"
 path = "tests/test_append_to_inittab.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_arithmetics"
 path = "tests/test_arithmetics.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_buffer"
 path = "tests/test_buffer.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_buffer_protocol"
 path = "tests/test_buffer_protocol.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_bytes"
 path = "tests/test_bytes.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_class_attributes"
 path = "tests/test_class_attributes.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_class_basics"
 path = "tests/test_class_basics.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_class_comparisons"
 path = "tests/test_class_comparisons.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_class_conversion"
 path = "tests/test_class_conversion.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_class_formatting"
 path = "tests/test_class_formatting.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_class_init"
 path = "tests/test_class_init.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_class_new"
 path = "tests/test_class_new.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_coroutine"
 path = "tests/test_coroutine.rs"
+required-features = ["experimental-async"]
 
 [[test]]
 name = "test_datetime"
@@ -240,42 +249,52 @@ path = "tests/test_datetime_import.rs"
 [[test]]
 name = "test_declarative_module"
 path = "tests/test_declarative_module.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_default_impls"
 path = "tests/test_default_impls.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_enum"
 path = "tests/test_enum.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_exceptions"
 path = "tests/test_exceptions.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_field_cfg"
 path = "tests/test_field_cfg.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_frompy_intopy_roundtrip"
 path = "tests/test_frompy_intopy_roundtrip.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_frompyobject"
 path = "tests/test_frompyobject.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_gc"
 path = "tests/test_gc.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_getter_setter"
 path = "tests/test_getter_setter.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_inheritance"
 path = "tests/test_inheritance.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_init_race"
@@ -284,34 +303,42 @@ path = "tests/test_init_race.rs"
 [[test]]
 name = "test_intopyobject"
 path = "tests/test_intopyobject.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_macro_docs"
 path = "tests/test_macro_docs.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_macros"
 path = "tests/test_macros.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_mapping"
 path = "tests/test_mapping.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_methods"
 path = "tests/test_methods.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_module"
 path = "tests/test_module.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_multiple_pymethods"
 path = "tests/test_multiple_pymethods.rs"
+required-features = ["multiple-pymethods"]
 
 [[test]]
 name = "test_proto_methods"
 path = "tests/test_proto_methods.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_pybuffer_drop_without_interpreter"
@@ -324,42 +351,52 @@ path = "tests/test_pyerr_debug_unformattable.rs"
 [[test]]
 name = "test_pyfunction"
 path = "tests/test_pyfunction.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_pyself"
 path = "tests/test_pyself.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_sequence"
 path = "tests/test_sequence.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_serde"
 path = "tests/test_serde.rs"
+required-features = ["serde"]
 
 [[test]]
 name = "test_static_slots"
 path = "tests/test_static_slots.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_string"
 path = "tests/test_string.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_super"
 path = "tests/test_super.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_text_signature"
 path = "tests/test_text_signature.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_variable_arguments"
 path = "tests/test_variable_arguments.rs"
+required-features = ["macros"]
 
 [[test]]
 name = "test_various"
 path = "tests/test_various.rs"
+required-features = ["macros"]
 
 [dependencies.anyhow]
 version = "1.0.1"
@@ -392,7 +429,8 @@ version = ">= 0.6.8, < 0.7"
 optional = true
 
 [dependencies.hashbrown]
-version = ">= 0.15.0, < 0.17"
+version = ">= 0.15.0, < 0.18"
+features = ["default-hasher"]
 optional = true
 default-features = false
 
@@ -450,10 +488,10 @@ version = "0.12"
 optional = true
 
 [dependencies.pyo3-ffi]
-version = "=0.28.3"
+version = "=0.29.2"
 
 [dependencies.pyo3-macros]
-version = "=0.28.3"
+version = "=0.29.2"
 optional = true
 
 [dependencies.rust_decimal]
@@ -502,6 +540,9 @@ default-features = false
 [dev-dependencies.rayon]
 version = "1.6.1"
 
+[dev-dependencies.regex]
+version = "1.12.3"
+
 [dev-dependencies.send_wrapper]
 version = "0.6"
 
@@ -518,16 +559,18 @@ version = "1.1.0"
 [dev-dependencies.tempfile]
 version = "3.12.0"
 
-[dev-dependencies.trybuild]
-version = ">=1.0.115"
+[dev-dependencies.ui_test]
+version = "0.30.4"
 
 [dev-dependencies.uuid]
 version = "1.10.0"
 features = ["v4"]
 
 [build-dependencies.pyo3-build-config]
-version = "=0.28.3"
-features = ["resolve-config"]
+version = "=0.29.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.ctrlc]
+version = "3.5.2"
 
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies.portable-atomic]
 version = "1.0"
@@ -543,7 +586,7 @@ let_unit_value = "warn"
 manual_assert = "warn"
 manual_ok_or = "warn"
 todo = "warn"
-undocumented_unsafe_blocks = "allow"
+undocumented_unsafe_blocks = "warn"
 unnecessary_wraps = "warn"
 used_underscore_binding = "warn"
 useless_transmute = "warn"
@@ -558,6 +601,16 @@ unused_lifetimes = "warn"
 [lints.rust.rust_2018_idioms]
 level = "warn"
 priority = -1
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(pyo3_disable_reference_pool)",
+    "cfg(pyo3_leak_on_drop_without_reference_pool)",
+    "cfg(pyo3_use_raw_dylib)",
+    'cfg(pyo3_dll, values("python3", "python3_d", "python3t", "python3t_d", "python38", "python38_d", "python39", "python39_d", "python310", "python310_d", "python311", "python311_d", "python312", "python312_d", "python313", "python313_d", "python313t", "python313t_d", "python314", "python314_d", "python314t", "python314t_d", "python315", "python315_d", "python315t", "python315t_d", "python316", "python316_d", "python316t", "python316t_d", "libpypy3.11-c"))',
+]
 
 [lints.rustdoc]
 bare_urls = "warn"

@@ -1,6 +1,11 @@
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use crate::ffi::*;
-use crate::types::any::PyAnyMethods;
 use crate::Python;
+
+#[cfg(not(Py_LIMITED_API))]
+use crate::types::any::PyAnyMethods;
 
 #[cfg(all(not(Py_LIMITED_API), any(not(any(PyPy, GraalPy)), feature = "macros")))]
 use crate::types::PyString;
@@ -116,7 +121,7 @@ fn test_timezone_from_offset_and_name() {
 #[test]
 #[cfg(not(any(Py_LIMITED_API, GraalPy)))]
 fn ascii_object_bitfield() {
-    let ob_base: PyObject = unsafe { std::mem::zeroed() };
+    let ob_base: PyObject = unsafe { core::mem::zeroed() };
 
     #[cfg_attr(Py_3_14, allow(unused_mut, unused_variables))]
     let mut o = PyASCIIObject {
@@ -126,7 +131,7 @@ fn ascii_object_bitfield() {
         hash: 0,
         state: 0u32,
         #[cfg(not(Py_3_12))]
-        wstr: std::ptr::null_mut() as *mut wchar_t,
+        wstr: core::ptr::null_mut() as *mut wchar_t,
     };
 
     #[cfg(not(Py_3_14))]
@@ -198,16 +203,15 @@ fn ascii() {
             // 2 and 4 byte macros return nonsense for this string instance.
             assert_eq!(PyUnicode_KIND(ptr), PyUnicode_1BYTE_KIND);
 
-            #[cfg(not(Py_3_14))]
-            assert!(!_PyUnicode_COMPACT_DATA(ptr).is_null());
-            // _PyUnicode_NONCOMPACT_DATA isn't valid for compact strings.
             assert!(!PyUnicode_DATA(ptr).is_null());
 
             assert_eq!(PyUnicode_GET_LENGTH(ptr), s.len().unwrap() as Py_ssize_t);
+            #[cfg(not(Py_3_12))]
             assert_eq!(PyUnicode_IS_READY(ptr), 1);
 
             // This has potential to mutate object. But it should be a no-op since
             // we're already ready.
+            #[cfg(not(Py_3_12))]
             assert_eq!(PyUnicode_READY(ptr), 0);
         }
     })
@@ -241,19 +245,18 @@ fn ucs4() {
             assert!(!PyUnicode_4BYTE_DATA(ptr).is_null());
             assert_eq!(PyUnicode_KIND(ptr), PyUnicode_4BYTE_KIND);
 
-            #[cfg(not(Py_3_14))]
-            assert!(!_PyUnicode_COMPACT_DATA(ptr).is_null());
-            // _PyUnicode_NONCOMPACT_DATA isn't valid for compact strings.
             assert!(!PyUnicode_DATA(ptr).is_null());
 
             assert_eq!(
                 PyUnicode_GET_LENGTH(ptr),
                 py_string.len().unwrap() as Py_ssize_t
             );
+            #[cfg(not(Py_3_12))]
             assert_eq!(PyUnicode_IS_READY(ptr), 1);
 
             // This has potential to mutate object. But it should be a no-op since
             // we're already ready.
+            #[cfg(not(Py_3_12))]
             assert_eq!(PyUnicode_READY(ptr), 0);
         }
     })
@@ -304,16 +307,16 @@ fn test_inc_dec_ref() {
     Python::attach(|py| {
         let obj = py.eval(c"object()", None, None).unwrap();
 
-        let ref_count = obj.get_refcnt();
+        let ref_count = obj._get_refcnt();
         let ptr = obj.as_ptr();
 
         unsafe { Py_INCREF(ptr) };
 
-        assert_eq!(obj.get_refcnt(), ref_count + 1);
+        assert_eq!(obj._get_refcnt(), ref_count + 1);
 
         unsafe { Py_DECREF(ptr) };
 
-        assert_eq!(obj.get_refcnt(), ref_count);
+        assert_eq!(obj._get_refcnt(), ref_count);
     })
 }
 
@@ -323,15 +326,15 @@ fn test_inc_dec_ref_immortal() {
     Python::attach(|py| {
         let obj = py.None();
 
-        let ref_count = obj.get_refcnt(py);
+        let ref_count = obj._get_refcnt(py);
         let ptr = obj.as_ptr();
 
         unsafe { Py_INCREF(ptr) };
 
-        assert_eq!(obj.get_refcnt(py), ref_count);
+        assert_eq!(obj._get_refcnt(py), ref_count);
 
         unsafe { Py_DECREF(ptr) };
 
-        assert_eq!(obj.get_refcnt(py), ref_count);
+        assert_eq!(obj._get_refcnt(py), ref_count);
     })
 }

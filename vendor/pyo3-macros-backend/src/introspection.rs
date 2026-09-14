@@ -11,16 +11,17 @@
 use crate::method::{FnArg, RegularArg};
 use crate::py_expr::PyExpr;
 use crate::pyfunction::FunctionSignature;
-use crate::utils::PyO3CratePath;
+use crate::utils::{PyO3CratePath, PythonDoc, StrOrExpr};
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, ToTokens};
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::mem::take;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use syn::{Attribute, Ident, ReturnType, Type, TypePath};
+use syn::{Attribute, Ident, Type, TypePath};
 
 static GLOBAL_COUNTER_FOR_UNIQUE_NAMES: AtomicUsize = AtomicUsize::new(0);
 
@@ -29,31 +30,32 @@ pub fn module_introspection_code<'a>(
     name: &str,
     members: impl IntoIterator<Item = &'a Ident>,
     members_cfg_attrs: impl IntoIterator<Item = &'a Vec<Attribute>>,
+    doc: Option<&PythonDoc>,
     incomplete: bool,
 ) -> TokenStream {
-    IntrospectionNode::Map(
-        [
-            ("type", IntrospectionNode::String("module".into())),
-            ("id", IntrospectionNode::IntrospectionId(None)),
-            ("name", IntrospectionNode::String(name.into())),
-            (
-                "members",
-                IntrospectionNode::List(
-                    members
-                        .into_iter()
-                        .zip(members_cfg_attrs)
-                        .map(|(member, attributes)| AttributedIntrospectionNode {
-                            node: IntrospectionNode::IntrospectionId(Some(ident_to_type(member))),
-                            attributes,
-                        })
-                        .collect(),
-                ),
+    let mut desc = BTreeMap::from([
+        ("type", IntrospectionNode::String("module".into())),
+        ("id", IntrospectionNode::IntrospectionId(None)),
+        ("name", IntrospectionNode::String(name.into())),
+        (
+            "members",
+            IntrospectionNode::List(
+                members
+                    .into_iter()
+                    .zip(members_cfg_attrs)
+                    .map(|(member, attributes)| AttributedIntrospectionNode {
+                        node: IntrospectionNode::IntrospectionId(Some(ident_to_type(member))),
+                        attributes,
+                    })
+                    .collect(),
             ),
-            ("incomplete", IntrospectionNode::Bool(incomplete)),
-        ]
-        .into(),
-    )
-    .emit(pyo3_crate_path)
+        ),
+        ("incomplete", IntrospectionNode::Bool(incomplete)),
+    ]);
+    if let Some(doc) = doc {
+        desc.insert("doc", IntrospectionNode::Doc(doc));
+    }
+    IntrospectionNode::Map(desc).emit(pyo3_crate_path)
 }
 
 pub fn class_introspection_code(
@@ -63,8 +65,9 @@ pub fn class_introspection_code(
     extends: Option<PyExpr>,
     is_final: bool,
     parent: Option<&Type>,
+    doc: Option<&PythonDoc>,
 ) -> TokenStream {
-    let mut desc = HashMap::from([
+    let mut desc = BTreeMap::from([
         ("type", IntrospectionNode::String("class".into())),
         (
             "id",
@@ -87,6 +90,9 @@ pub fn class_introspection_code(
             IntrospectionNode::IntrospectionId(Some(Cow::Borrowed(parent))),
         );
     }
+    if let Some(doc) = &doc {
+        desc.insert("doc", IntrospectionNode::Doc(doc));
+    }
     IntrospectionNode::Map(desc).emit(pyo3_crate_path)
 }
 
@@ -97,17 +103,24 @@ pub fn function_introspection_code(
     name: &str,
     signature: &FunctionSignature<'_>,
     first_argument: Option<&'static str>,
-    returns: ReturnType,
+    returns: PyExpr,
     decorators: impl IntoIterator<Item = PyExpr>,
     is_async: bool,
+    is_returning_not_implemented_on_extraction_error: bool,
+    doc: Option<&PythonDoc>,
     parent: Option<&Type>,
 ) -> TokenStream {
-    let mut desc = HashMap::from([
+    let mut desc = BTreeMap::from([
         ("type", IntrospectionNode::String("function".into())),
         ("name", IntrospectionNode::String(name.into())),
         (
             "arguments",
-            arguments_introspection_data(signature, first_argument, parent),
+            arguments_introspection_data(
+                signature,
+                first_argument,
+                is_returning_not_implemented_on_extraction_error,
+                parent,
+            ),
         ),
         (
             "returns",
@@ -118,11 +131,7 @@ pub fn function_introspection_code(
             {
                 returns.as_type_hint().into()
             } else {
-                match returns {
-                    ReturnType::Default => PyExpr::builtin("None"),
-                    ReturnType::Type(_, ty) => PyExpr::from_return_type(*ty, parent),
-                }
-                .into()
+                returns.into()
             },
         ),
     ]);
@@ -139,6 +148,9 @@ pub fn function_introspection_code(
     if !decorators.is_empty() {
         desc.insert("decorators", IntrospectionNode::List(decorators));
     }
+    if let Some(doc) = doc {
+        desc.insert("doc", IntrospectionNode::Doc(doc));
+    }
     if let Some(parent) = parent {
         desc.insert(
             "parent",
@@ -154,9 +166,10 @@ pub fn attribute_introspection_code(
     name: String,
     value: PyExpr,
     rust_type: Type,
+    doc: Option<&PythonDoc>,
     is_final: bool,
 ) -> TokenStream {
-    let mut desc = HashMap::from([
+    let mut desc = BTreeMap::from([
         ("type", IntrospectionNode::String("attribute".into())),
         ("name", IntrospectionNode::String(name.into())),
         (
@@ -193,12 +206,16 @@ pub fn attribute_introspection_code(
         );
         desc.insert("value", value.into());
     }
+    if let Some(doc) = doc {
+        desc.insert("doc", IntrospectionNode::Doc(doc));
+    }
     IntrospectionNode::Map(desc).emit(pyo3_crate_path)
 }
 
 fn arguments_introspection_data<'a>(
     signature: &'a FunctionSignature<'a>,
     first_argument: Option<&'a str>,
+    is_returning_not_implemented_on_extraction_error: bool,
     class_type: Option<&Type>,
 ) -> IntrospectionNode<'a> {
     let mut argument_desc = signature.arguments.iter().filter(|arg| {
@@ -234,7 +251,12 @@ fn arguments_introspection_data<'a>(
         } else {
             panic!("Less arguments than in python signature");
         };
-        let arg = argument_introspection_data(param, arg_desc, class_type);
+        let arg = argument_introspection_data(
+            param,
+            arg_desc,
+            is_returning_not_implemented_on_extraction_error,
+            class_type,
+        );
         if i < signature.python_signature.positional_only_parameters {
             posonlyargs.push(arg);
         } else {
@@ -246,7 +268,7 @@ fn arguments_introspection_data<'a>(
         let Some(FnArg::VarArgs(arg_desc)) = argument_desc.next() else {
             panic!("Fewer arguments than in python signature");
         };
-        let mut params = HashMap::from([("name", IntrospectionNode::String(param.into()))]);
+        let mut params = BTreeMap::from([("name", IntrospectionNode::String(param.into()))]);
         if let Some(annotation) = &arg_desc.annotation {
             params.insert("annotation", annotation.clone().into());
         }
@@ -257,21 +279,26 @@ fn arguments_introspection_data<'a>(
         let Some(FnArg::Regular(arg_desc)) = argument_desc.next() else {
             panic!("Less arguments than in python signature");
         };
-        kwonlyargs.push(argument_introspection_data(param, arg_desc, class_type));
+        kwonlyargs.push(argument_introspection_data(
+            param,
+            arg_desc,
+            is_returning_not_implemented_on_extraction_error,
+            class_type,
+        ));
     }
 
     if let Some(param) = &signature.python_signature.kwargs {
         let Some(FnArg::KwArgs(arg_desc)) = argument_desc.next() else {
             panic!("Less arguments than in python signature");
         };
-        let mut params = HashMap::from([("name", IntrospectionNode::String(param.into()))]);
+        let mut params = BTreeMap::from([("name", IntrospectionNode::String(param.into()))]);
         if let Some(annotation) = &arg_desc.annotation {
             params.insert("annotation", annotation.clone().into());
         }
         kwarg = Some(IntrospectionNode::Map(params));
     }
 
-    let mut map = HashMap::new();
+    let mut map = BTreeMap::new();
     if !posonlyargs.is_empty() {
         map.insert("posonlyargs", IntrospectionNode::List(posonlyargs));
     }
@@ -293,14 +320,18 @@ fn arguments_introspection_data<'a>(
 fn argument_introspection_data<'a>(
     name: &'a str,
     desc: &'a RegularArg<'_>,
+    is_returning_not_implemented_on_extraction_error: bool,
     class_type: Option<&Type>,
 ) -> AttributedIntrospectionNode<'a> {
-    let mut params: HashMap<_, _> = [("name", IntrospectionNode::String(name.into()))].into();
+    let mut params: BTreeMap<_, _> = [("name", IntrospectionNode::String(name.into()))].into();
     if let Some(expr) = &desc.default_value {
         params.insert("default", PyExpr::constant_from_expression(expr).into());
     }
 
-    if let Some(annotation) = &desc.annotation {
+    if is_returning_not_implemented_on_extraction_error {
+        // all inputs are allowed, we use `object`
+        params.insert("annotation", PyExpr::builtin("object").into());
+    } else if let Some(annotation) = &desc.annotation {
         params.insert("annotation", annotation.clone().into());
     } else if desc.from_py_with.is_none() {
         // If from_py_with is set we don't know anything on the input type
@@ -317,7 +348,8 @@ enum IntrospectionNode<'a> {
     Bool(bool),
     IntrospectionId(Option<Cow<'a, Type>>),
     TypeHint(Cow<'a, PyExpr>),
-    Map(HashMap<&'static str, IntrospectionNode<'a>>),
+    Doc(&'a PythonDoc),
+    Map(BTreeMap<&'static str, IntrospectionNode<'a>>),
     List(Vec<AttributedIntrospectionNode<'a>>),
 }
 
@@ -356,6 +388,25 @@ impl IntrospectionNode<'_> {
                     pyo3_crate_path,
                 ));
             }
+            Self::Doc(doc) => {
+                content.push_str("\"");
+                for part in &doc.parts {
+                    match part {
+                        StrOrExpr::Str {value, ..} => content.push_str(&escape_json_string(value)),
+                        StrOrExpr::Expr(value) => content.push_tokens(quote! {{
+                            const DOC: &str = #value;
+                            const DOC_LEN: usize = #pyo3_crate_path::impl_::introspection::escaped_json_string_len(&DOC);
+                            const DOC_SER: [u8; DOC_LEN] = {
+                                let mut result: [u8; DOC_LEN] = [0; DOC_LEN];
+                                #pyo3_crate_path::impl_::introspection::escape_json_string(&DOC, &mut result);
+                                result
+                            };
+                            &DOC_SER
+                        }}),
+                    }
+                }
+                content.push_str("\"");
+            }
             Self::Map(map) => {
                 content.push_str("{");
                 for (i, (key, value)) in map.into_iter().enumerate() {
@@ -370,20 +421,31 @@ impl IntrospectionNode<'_> {
             }
             Self::List(list) => {
                 content.push_str("[");
-                for (i, AttributedIntrospectionNode { node, attributes }) in
-                    list.into_iter().enumerate()
-                {
-                    if attributes.is_empty() {
+                if list.iter().all(|element| element.attributes.is_empty()) {
+                    for (i, element) in list.into_iter().enumerate() {
                         if i > 0 {
                             content.push_str(",");
                         }
-                        node.add_to_serialization(content, pyo3_crate_path);
-                    } else {
+                        element.node.add_to_serialization(content, pyo3_crate_path);
+                    }
+                } else {
+                    // A `,` must only be written if at least one of the elements before the one
+                    // it precedes is compiled in, so we gate it behind an `any(..)` of their
+                    // `cfg`s on top of the element's own. This needs no special case: `any()` is
+                    // false, so the first element gets no separator, and `all()` is true, so an
+                    // element without `cfg` makes every later separator unconditional.
+                    let mut preceding = Vec::new();
+                    for AttributedIntrospectionNode { node, attributes } in list {
+                        content.push_tokens(
+                            quote! { #[cfg(any(#(#preceding),*))] #(#attributes)* ",".as_bytes() },
+                        );
+                        let cfgs = attributes
+                            .iter()
+                            .filter_map(|attribute| attribute.meta.require_list().ok())
+                            .map(|cfg| &cfg.tokens);
+                        preceding.push(quote! { all(#(#cfgs),*) });
                         // We serialize the element to easily gate it behind the attributes
                         let mut nested_builder = ConcatenationBuilder::default();
-                        if i > 0 {
-                            nested_builder.push_str(",");
-                        }
                         node.add_to_serialization(&mut nested_builder, pyo3_crate_path);
                         let nested_content = nested_builder.into_token_stream(pyo3_crate_path);
                         content.push_tokens(quote! { #(#attributes)* #nested_content });
@@ -556,4 +618,24 @@ fn ident_to_type(ident: &Ident) -> Cow<'static, Type> {
         }
         .into(),
     )
+}
+
+fn escape_json_string(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\x08' => output.push_str("\\b"),
+            '\x0C' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            c @ '\0'..='\x1F' => {
+                write!(output, "\\u{:0>4x}", u32::from(c)).unwrap();
+            }
+            c => output.push(c),
+        }
+    }
+    output
 }

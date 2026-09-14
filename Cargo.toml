@@ -1,14 +1,14 @@
 [package]
 name = "qpipe"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-base64 = "0.22.1"
-env_logger = "0.11.9"
-log = "0.4.29"
-rand = "0.10.0"
+base64 = "0.23.1"
+env_logger = "0.11.11"
+log = "0.4.34"
+rand = "0.10.2"
 
 rmp-serde = "1"          # for typed Rust structs
 rmpv      = "1"          # for schema-less Value, useful in CLI tools

@@ -1,5 +1,7 @@
 use core::time::Duration as UnsignedDuration;
 
+use jcore::Timestamp as JTimestamp;
+
 use crate::{
     duration::{Duration, SDuration},
     error::{
@@ -9,9 +11,8 @@ use crate::{
         self,
         temporal::{self, DEFAULT_DATETIME_PARSER},
     },
-    shared::util::itime::ITimestamp,
     tz::{Offset, TimeZone},
-    util::{b, constant, round::Increment},
+    util::{constant, round::Increment},
     zoned::Zoned,
     RoundMode, SignedDuration, Span, SpanRound, Unit,
 };
@@ -309,8 +310,9 @@ use crate::{
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Timestamp {
-    dur: SignedDuration,
+    dur: JTimestamp,
 }
 
 impl Timestamp {
@@ -328,8 +330,7 @@ impl Timestamp {
     /// let dt = Offset::MIN.to_datetime(Timestamp::MIN);
     /// assert_eq!(dt, date(-9999, 1, 1).at(0, 0, 0, 0));
     /// ```
-    pub const MIN: Timestamp =
-        Timestamp { dur: SignedDuration::new(b::UnixSeconds::MIN, 0) };
+    pub const MIN: Timestamp = Timestamp { dur: JTimestamp::MIN };
 
     /// The maximum representable timestamp.
     ///
@@ -345,12 +346,7 @@ impl Timestamp {
     /// let dt = Offset::MAX.to_datetime(Timestamp::MAX);
     /// assert_eq!(dt, date(9999, 12, 31).at(23, 59, 59, 999_999_999));
     /// ```
-    pub const MAX: Timestamp = Timestamp {
-        dur: SignedDuration::new(
-            b::UnixSeconds::MAX,
-            b::SignedSubsecNanosecond::MAX,
-        ),
-    };
+    pub const MAX: Timestamp = Timestamp { dur: JTimestamp::MAX };
 
     /// The Unix epoch represented as a timestamp.
     ///
@@ -360,7 +356,8 @@ impl Timestamp {
     /// A timestamp is positive if and only if it is greater than the Unix
     /// epoch. A timestamp is negative if and only if it is less than the Unix
     /// epoch.
-    pub const UNIX_EPOCH: Timestamp = Timestamp { dur: SignedDuration::ZERO };
+    pub const UNIX_EPOCH: Timestamp =
+        Timestamp { dur: JTimestamp::UNIX_EPOCH };
 
     /// Returns the current system time as a timestamp.
     ///
@@ -480,17 +477,8 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn new(second: i64, nanosecond: i32) -> Result<Timestamp, Error> {
-        let secs = b::UnixSeconds::check(second)?;
-        let nanos = b::SignedSubsecNanosecond::check(nanosecond)?;
-        if secs == b::UnixSeconds::MIN && nanos < 0 {
-            return Err(b::UnixSeconds::error().into());
-        }
-        // Technically, `SignedDuration::new` is doing a little more work
-        // than is needed here. That is, the check on nanos above ensures
-        // that it's in the range `-999_999_999..=999_999_999`, but
-        // `SignedDuration::new` handles any `i32` value. It's not clear if
-        // it's worth inlining the work here.
-        let dur = SignedDuration::new(secs, nanos);
+        let dur =
+            JTimestamp::new(second, nanosecond).map_err(Error::jcore_range)?;
         Ok(Timestamp { dur })
     }
 
@@ -517,19 +505,11 @@ impl Timestamp {
     /// );
     /// ```
     #[inline]
-    pub const fn constant(mut second: i64, mut nanosecond: i32) -> Timestamp {
-        second = constant::unwrapr!(
-            b::UnixSeconds::checkc(second),
-            "seconds out of range for `jiff::Timestamp`",
+    pub const fn constant(second: i64, nanosecond: i32) -> Timestamp {
+        let dur = constant::unwrapr!(
+            JTimestamp::new(second, nanosecond),
+            "invalid timestamp"
         );
-        nanosecond = constant::unwrapr!(
-            b::SignedSubsecNanosecond::checkc(nanosecond as i64),
-            "nanoseconds out of range of `jiff::Timestamp`",
-        );
-        if second == b::UnixSeconds::MIN && nanosecond < 0 {
-            panic!("nanoseconds must be >=0 when seconds are minimal");
-        }
-        let dur = SignedDuration::new(second, nanosecond);
         Timestamp { dur }
     }
 
@@ -600,12 +580,9 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn from_second(second: i64) -> Result<Timestamp, Error> {
-        // We specialize this instead of going through `Timestamp::new` to
-        // avoid calling `SignedDuration::new`, which has to handle the case
-        // of balancing nanos.
-        let second = b::UnixSeconds::check(second)?;
-        let dur = SignedDuration::from_secs(second);
-        Ok(Timestamp { dur })
+        JTimestamp::from_second(second)
+            .map(|dur| Timestamp { dur })
+            .map_err(Error::jcore_range)
     }
 
     /// Creates a new instant in time from the number of milliseconds elapsed
@@ -676,9 +653,9 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn from_millisecond(millisecond: i64) -> Result<Timestamp, Error> {
-        let millisecond = b::UnixMilliseconds::check(millisecond)?;
-        let dur = SignedDuration::from_millis(millisecond);
-        Ok(Timestamp { dur })
+        JTimestamp::from_millisecond(millisecond)
+            .map(|dur| Timestamp { dur })
+            .map_err(Error::jcore_range)
     }
 
     /// Creates a new instant in time from the number of microseconds elapsed
@@ -749,9 +726,9 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn from_microsecond(microsecond: i64) -> Result<Timestamp, Error> {
-        let microsecond = b::UnixMicroseconds::check(microsecond)?;
-        let dur = SignedDuration::from_micros(microsecond);
-        Ok(Timestamp { dur })
+        JTimestamp::from_microsecond(microsecond)
+            .map(|dur| Timestamp { dur })
+            .map_err(Error::jcore_range)
     }
 
     /// Creates a new instant in time from the number of nanoseconds elapsed
@@ -822,10 +799,9 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn from_nanosecond(nanosecond: i128) -> Result<Timestamp, Error> {
-        let dur = SignedDuration::try_from_nanos_i128(nanosecond)
-            .ok_or_else(|| b::SpecialBoundsError::UnixNanoseconds)?;
-        b::UnixSeconds::check(dur.as_secs())?;
-        Ok(Timestamp { dur })
+        JTimestamp::from_nanosecond(nanosecond)
+            .map(|dur| Timestamp { dur })
+            .map_err(Error::jcore_range)
     }
 
     /// Creates a new timestamp from a `Duration` with the given sign since the
@@ -924,19 +900,9 @@ impl Timestamp {
     pub fn from_duration(
         duration: SignedDuration,
     ) -> Result<Timestamp, Error> {
-        let dur = duration;
-        b::UnixSeconds::check(duration.as_secs())?;
-        // N.B. We don't need to check subsecs because `SignedDuration`
-        // guarantees its nanos are in the range `-999_999_999..=999_999_999`
-        // already.
-        //
-        // ... but we do have to check that the *combination* of seconds and
-        // nanoseconds aren't out of bounds, which is possible even when both
-        // are, on their own, legal values.
-        if dur.as_secs() == b::UnixSeconds::MIN && dur.subsec_nanos() < 0 {
-            return Err(b::UnixSeconds::error().into());
-        }
-        Ok(Timestamp { dur })
+        // N.B. We could do less work here since we know the signed duration
+        // is well formed (i.e., `|nanos| < 1 second` is always true).
+        Timestamp::new(duration.as_secs(), duration.subsec_nanos())
     }
 
     /// Returns this timestamp as a number of seconds since the Unix epoch.
@@ -963,7 +929,7 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn as_second(self) -> i64 {
-        self.dur.as_secs()
+        self.dur.as_second()
     }
 
     /// Returns this timestamp as a number of milliseconds since the Unix
@@ -992,15 +958,7 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn as_millisecond(self) -> i64 {
-        // N.B. The below is inlined from `SignedDuration::as_millis`
-        // to avoid materializing an `i128`.
-
-        // OK because the range of `Timestamp` guarantees that its
-        // representation as milliseconds fits into an i64.
-        let millis = self.dur.as_secs() * b::MILLIS_PER_SEC;
-        // OK because subsec_millis maxes out at 999, and adding that to
-        // b::UnixSeconds::MAX*1_000 will never overflow an i64.
-        millis + i64::from(self.dur.subsec_millis())
+        self.dur.as_millisecond()
     }
 
     /// Returns this timestamp as a number of microseconds since the Unix
@@ -1029,15 +987,7 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn as_microsecond(self) -> i64 {
-        // N.B. The below is inlined from `SignedDuration::as_micros`
-        // to avoid materializing an `i128`.
-
-        // OK because the range of `Timestamp` guarantees that its
-        // representation as microseconds fits into an i64.
-        let millis = self.dur.as_secs() * b::MICROS_PER_SEC;
-        // OK because subsec_millis maxes out at 999, and adding that to
-        // b::UnixSeconds::MAX*1_000 will never overflow an i64.
-        millis + i64::from(self.dur.subsec_micros())
+        self.dur.as_microsecond()
     }
 
     /// Returns this timestamp as a number of nanoseconds since the Unix
@@ -1067,7 +1017,7 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn as_nanosecond(self) -> i128 {
-        self.dur.as_nanos()
+        self.dur.as_nanosecond()
     }
 
     /// Returns the fractional second component of this timestamp in units
@@ -1099,7 +1049,7 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn subsec_millisecond(self) -> i32 {
-        self.dur.subsec_millis()
+        self.dur.subsec_millisecond()
     }
 
     /// Returns the fractional second component of this timestamp in units of
@@ -1131,7 +1081,7 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn subsec_microsecond(self) -> i32 {
-        self.dur.subsec_micros()
+        self.dur.subsec_microsecond()
     }
 
     /// Returns the fractional second component of this timestamp in units of
@@ -1159,7 +1109,7 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn subsec_nanosecond(self) -> i32 {
-        self.dur.subsec_nanos()
+        self.dur.subsec_nanosecond()
     }
 
     /// Returns this timestamp as a [`SignedDuration`] since the Unix epoch.
@@ -1186,7 +1136,12 @@ impl Timestamp {
     /// ```
     #[inline]
     pub fn as_duration(self) -> SignedDuration {
-        self.dur
+        // OK because a `Timestamp` has a strictly smaller range than a duration,
+        // _and_ because we know `|nanos| < 1` as well.
+        SignedDuration::new_unchecked(
+            self.dur.as_second(),
+            self.dur.subsec_nanosecond(),
+        )
     }
 
     /// Returns the sign of this timestamp.
@@ -1445,10 +1400,15 @@ impl Timestamp {
     ///
     /// let ts = Timestamp::MAX;
     /// assert_eq!(ts.to_string(), "9999-12-30T22:00:00.999999999Z");
+    /// assert!(ts.checked_add(1.second()).is_err());
     /// assert!(ts.checked_add(1.nanosecond()).is_err());
+    /// assert!(ts.checked_add(
+    ///     175_307_616.hours().minutes(10_518_456_960i64).seconds(631_107_417_600i64),
+    /// ).is_err());
     ///
     /// let ts = Timestamp::MIN;
     /// assert_eq!(ts.to_string(), "-009999-01-02T01:59:59Z");
+    /// assert!(ts.checked_add(-1.second()).is_err());
     /// assert!(ts.checked_add(-1.nanosecond()).is_err());
     /// ```
     ///
@@ -1502,12 +1462,12 @@ impl Timestamp {
         // Note that this only works when *both* the span and timestamp lack
         // fractional seconds.
         if self.subsec_nanosecond() == 0 && !span.has_fractional_seconds() {
-            let span_seconds = span.to_hms_seconds();
-            let time_seconds = self.as_second();
-            let sum = b::UnixSeconds::checked_add(span_seconds, time_seconds)
+            let dur = self
+                .dur
+                .checked_add_seconds(span.to_hms_seconds())
+                .map_err(Error::jcore_range)
                 .context(E::OverflowAddSpan)?;
-            // We know `sum` is in bounds so we don't need to recheck.
-            return Ok(Timestamp { dur: SignedDuration::from_secs(sum) });
+            return Ok(Timestamp { dur });
         }
         let sum = self
             .as_duration()
@@ -2164,11 +2124,14 @@ impl Timestamp {
     ///
     /// # Errors and panics
     ///
-    /// While this routine itself does not error or panic, using the value
-    /// returned may result in a panic if formatting fails. See the
-    /// documentation on [`fmt::strtime::Display`] for more information.
+    /// This will never error or panic. In particular,
+    /// [lenient mode](crate::fmt::strtime::Config::lenient) is enabled, which
+    /// means that all possible strings have some non-error interpretation.
+    /// Note that because of this, and since Jiff may add new conversion
+    /// specifiers in the future, the behavior of a format string may change
+    /// when it would otherwise be invalid.
     ///
-    /// To format in a way that surfaces errors without panicking, use either
+    /// To format in a way that surfaces errors, use either
     /// [`fmt::strtime::format`] or [`fmt::strtime::BrokenDownTime::format`].
     ///
     /// # Example
@@ -2184,6 +2147,33 @@ impl Timestamp {
     /// assert_eq!(string, "Fri Jan  2 12:00:00 AM UTC 1970");
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Example: errors are silently ignored
+    ///
+    /// If the formatting string is malformed in some way, then it is silently
+    /// ignored. For example, when using an invalid formatting directive:
+    ///
+    /// ```
+    /// use jiff::Timestamp;
+    ///
+    /// let ts = Timestamp::UNIX_EPOCH;
+    /// let string = ts.strftime("%Y %").to_string();
+    /// assert_eq!(string, "1970 %");
+    /// ```
+    ///
+    /// If one wants to surface errors from a formatting string, use a lower
+    /// level API:
+    ///
+    /// ```
+    /// use jiff::Timestamp;
+    ///
+    /// let ts = Timestamp::UNIX_EPOCH;
+    /// assert_eq!(
+    ///     jiff::fmt::strtime::format("%Y %", ts).unwrap_err().to_string(),
+    ///     "strftime formatting failed: invalid format string, \
+    ///      expected byte after `%`, but found end of format string",
+    /// );
     /// ```
     #[inline]
     pub fn strftime<'f, F: 'f + ?Sized + AsRef<[u8]>>(
@@ -2231,21 +2221,13 @@ impl Timestamp {
 /// Internal APIs.
 impl Timestamp {
     #[inline]
-    pub(crate) const fn from_itimestamp_const(its: ITimestamp) -> Timestamp {
-        Timestamp {
-            dur: SignedDuration::new_without_nano_overflow(
-                its.second,
-                its.nanosecond,
-            ),
-        }
+    pub(crate) const fn to_jcore(&self) -> JTimestamp {
+        self.dur
     }
 
     #[inline]
-    pub(crate) const fn to_itimestamp_const(&self) -> ITimestamp {
-        ITimestamp {
-            second: self.dur.as_secs(),
-            nanosecond: self.dur.subsec_nanos(),
-        }
+    pub(crate) const fn from_jcore(timestamp: JTimestamp) -> Timestamp {
+        Timestamp { dur: timestamp }
     }
 }
 
@@ -2632,6 +2614,17 @@ impl TryFrom<std::time::SystemTime> for Timestamp {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Timestamp {
+    fn format(&self, f: defmt::Formatter) {
+        use crate::fmt::{temporal::DEFAULT_DATETIME_PRINTER, DefmtWrite};
+
+        defmt::unwrap!(
+            DEFAULT_DATETIME_PRINTER.print_timestamp(self, DefmtWrite(f))
+        );
+    }
+}
+
 #[cfg(feature = "serde")]
 impl serde_core::Serialize for Timestamp {
     #[inline]
@@ -2689,24 +2682,28 @@ impl<'de> serde_core::Deserialize<'de> for Timestamp {
 #[cfg(test)]
 impl quickcheck::Arbitrary for Timestamp {
     fn arbitrary(g: &mut quickcheck::Gen) -> Timestamp {
-        let secs = b::UnixSeconds::arbitrary(g);
+        use crate::util::b;
+
+        let secs = b::UnixEpochSeconds::arbitrary(g);
         let mut nanos = b::SignedSubsecNanosecond::arbitrary(g);
         // nanoseconds must be zero for the minimum second value,
         // so just clamp it to 0.
-        if secs == b::UnixSeconds::MIN && nanos < 0 {
+        if secs == b::UnixEpochSeconds::MIN && nanos < 0 {
             nanos = 0;
         }
         Timestamp::new(secs, nanos).unwrap_or_default()
     }
 
     fn shrink(&self) -> alloc::boxed::Box<dyn Iterator<Item = Self>> {
+        use crate::util::b;
+
         let secs = self.as_second();
         let nanos = self.subsec_nanosecond();
         alloc::boxed::Box::new((secs, nanos).shrink().filter_map(
             |(secs, nanos)| {
-                let secs = b::UnixSeconds::check(secs).ok()?;
+                let secs = b::UnixEpochSeconds::check(secs).ok()?;
                 let nanos = b::SignedSubsecNanosecond::check(nanos).ok()?;
-                if secs == b::UnixSeconds::MIN && nanos > 0 {
+                if secs == b::UnixEpochSeconds::MIN && nanos > 0 {
                     None
                 } else {
                     Timestamp::new(secs, nanos).ok()
@@ -3495,6 +3492,7 @@ mod tests {
     use crate::{
         civil::{self, datetime},
         tz::Offset,
+        util::b,
         ToSpan,
     };
 
@@ -3521,20 +3519,20 @@ mod tests {
     #[test]
     fn to_datetime_specific_examples() {
         let tests = [
-            ((b::UnixSeconds::MIN, 0), (-9999, 1, 2, 1, 59, 59, 0)),
+            ((b::UnixEpochSeconds::MIN, 0), (-9999, 1, 2, 1, 59, 59, 0)),
             (
-                (b::UnixSeconds::MIN + 1, -999_999_999),
+                (b::UnixEpochSeconds::MIN + 1, -999_999_999),
                 (-9999, 1, 2, 1, 59, 59, 1),
             ),
             ((-1, 1), (1969, 12, 31, 23, 59, 59, 1)),
-            ((b::UnixSeconds::MAX, 0), (9999, 12, 30, 22, 0, 0, 0)),
-            ((b::UnixSeconds::MAX - 1, 0), (9999, 12, 30, 21, 59, 59, 0)),
+            ((b::UnixEpochSeconds::MAX, 0), (9999, 12, 30, 22, 0, 0, 0)),
+            ((b::UnixEpochSeconds::MAX - 1, 0), (9999, 12, 30, 21, 59, 59, 0)),
             (
-                (b::UnixSeconds::MAX - 1, 999_999_999),
+                (b::UnixEpochSeconds::MAX - 1, 999_999_999),
                 (9999, 12, 30, 21, 59, 59, 999_999_999),
             ),
             (
-                (b::UnixSeconds::MAX, 999_999_999),
+                (b::UnixEpochSeconds::MAX, 999_999_999),
                 (9999, 12, 30, 22, 0, 0, 999_999_999),
             ),
             ((-2, -1), (1969, 12, 31, 23, 59, 57, 999_999_999)),
@@ -3577,11 +3575,11 @@ mod tests {
             let midpoint = day * 86_400;
             for second in seconds {
                 let second = midpoint + second;
-                if b::UnixSeconds::check(second).is_err() {
+                if b::UnixEpochSeconds::check(second).is_err() {
                     continue;
                 }
                 for nano in nanos {
-                    if second == b::UnixSeconds::MIN && nano != 0 {
+                    if second == b::UnixEpochSeconds::MIN && nano != 0 {
                         continue;
                     }
                     let t = Timestamp::new(second, nano).unwrap();
@@ -3598,11 +3596,13 @@ mod tests {
 
     #[test]
     fn invalid_time() {
-        assert!(Timestamp::new(b::UnixSeconds::MIN, -1).is_err());
-        assert!(Timestamp::new(b::UnixSeconds::MIN, -999_999_999).is_err());
+        assert!(Timestamp::new(b::UnixEpochSeconds::MIN, -1).is_err());
+        assert!(
+            Timestamp::new(b::UnixEpochSeconds::MIN, -999_999_999).is_err()
+        );
         // These are greater than the minimum and thus okay!
-        assert!(Timestamp::new(b::UnixSeconds::MIN, 1).is_ok());
-        assert!(Timestamp::new(b::UnixSeconds::MIN, 999_999_999).is_ok());
+        assert!(Timestamp::new(b::UnixEpochSeconds::MIN, 1).is_ok());
+        assert!(Timestamp::new(b::UnixEpochSeconds::MIN, 999_999_999).is_ok());
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -3622,7 +3622,7 @@ mod tests {
     fn nanosecond_roundtrip_boundaries() {
         let inst = Timestamp::MIN;
         let nanos = inst.as_nanosecond();
-        assert_eq!(0, nanos % (b::NANOS_PER_SEC as i128));
+        assert_eq!(0, nanos % (jcore::constants::NANOS_PER_SEC as i128));
         let got = Timestamp::from_nanosecond(nanos).unwrap();
         assert_eq!(inst, got);
 
@@ -3630,7 +3630,7 @@ mod tests {
         let nanos = inst.as_nanosecond();
         assert_eq!(
             b::SignedSubsecNanosecond::MAX as i128,
-            nanos % (b::NANOS_PER_SEC as i128)
+            nanos % (jcore::constants::NANOS_PER_SEC as i128)
         );
         let got = Timestamp::from_nanosecond(nanos).unwrap();
         assert_eq!(inst, got);

@@ -197,7 +197,7 @@ For arguments, see the [`Method arguments`](#method-arguments) section below.
 
 An initializer implements Python's `__init__` method.
 
-It may be required when it's needed to control an object initalization flow on the Rust code.
+It may be required when it's needed to control an object initialization flow on the Rust code.
 If possible handling this in `__new__` should be preferred, but in some cases, like subclassing native types, overwriting `__init__` might be necessary.
 For example, you define a class that extends `PyDict` and don't want that the original `__init__` method of `PyDict` been called.
 In this case by defining an own `__init__` method it's possible to stop initialization flow.
@@ -242,9 +242,10 @@ impl MyDict {
         // call the super types __init__
         PySuper::new(&PyDict::type_object(slf.py()), slf)?
             .call_method("__init__", args.to_owned(), kwargs)?;
-        // Note: if `MyDict` allows further subclassing, and this is called from such a subclass,
-        // then this will not that any overrides into account that such a subclass may have defined.
-        // In such a case it may be preferred to just call `slf.set_item` and let Python figure it out.
+        // Note: if `MyDict` allows further subclassing (i.e. uses the `#[pyclass(subclass)]` option), and
+        // this is called from such a subclass, then this will not respect any overrides that subclass may
+        // have defined. Accordingly if `MyDict` allows subclassing it may be preferred to just call
+        // `slf.set_item` and let Python resolve the correct subclass method.
         slf.as_super().set_item("my_key", "always insert this key")?;
         Ok(())
     }
@@ -332,7 +333,8 @@ Python::attach(|py| {
 ```
 
 A `Bound<'py, T>` is restricted to the Python lifetime `'py`.
-To make the object longer lived (for example, to store it in a struct on the Rust side), use `Py<T>`. `Py<T>` needs a `Python<'_>` token to allow access:
+To make the object longer lived (for example, to store it in a struct on the Rust side), use `Py<T>`.
+`Py<T>` needs a `Python<'_>` token to allow access:
 
 ```rust
 # use pyo3::prelude::*;
@@ -403,8 +405,7 @@ Consult the table below to determine which type your constructor should return:
 |                             | **Cannot fail**           | **May fail**                      |
 |-----------------------------|---------------------------|-----------------------------------|
 |**No inheritance**           | `T`                       | `PyResult<T>`                     |
-|**Inheritance(T Inherits U)**| `(T, U)`                  | `PyResult<(T, U)>`                |
-|**Inheritance(General Case)**| [`PyClassInitializer<T>`] | `PyResult<PyClassInitializer<T>>` |
+|**Inheritance**              | [`PyClassInitializer<T>`] | `PyResult<PyClassInitializer<T>>` |
 
 ## Inheritance
 
@@ -412,8 +413,7 @@ By default, `object`, i.e. `PyAny` is used as the base class.
 To override this default, use the `extends` parameter for `pyclass` with the full path to the base class.
 Currently, only classes defined in Rust and builtins provided by PyO3 can be inherited from; inheriting from other classes defined in Python is not yet supported ([#991](https://github.com/PyO3/pyo3/issues/991)).
 
-For convenience, `(T, U)` implements `Into<PyClassInitializer<T>>` where `U` is the base class of `T`.
-But for a more deeply nested inheritance, you have to return `PyClassInitializer<T>` explicitly.
+To initialize a class, which inherits from another class, use the `PyClassInitializer` API.
 
 To get a parent class from a child, use [`PyRef`] instead of `&self` for methods, or [`PyRefMut`] instead of `&mut self`.
 Then you can access a parent class by `self_.as_super()` as `&PyRef<Self::BaseClass>`, or by `self_.into_super()` as `PyRef<Self::BaseClass>` (and similar for the `PyRefMut` case).
@@ -447,8 +447,9 @@ struct SubClass {
 #[pymethods]
 impl SubClass {
     #[new]
-    fn new() -> (Self, BaseClass) {
-        (SubClass { val2: 15 }, BaseClass::new())
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(BaseClass::new())
+            .add_subclass(SubClass { val2: 15 })
     }
 
     fn method2(self_: PyRef<'_, Self>) -> PyResult<usize> {
@@ -885,7 +886,28 @@ impl MyClass {
 
 ## Class attributes
 
-To create a class attribute (also called [class variable][classattr]), a method without any arguments can be annotated with the `#[classattr]` attribute.
+To create a class attribute (also called [class variable][classattr]), an associated constant can be annotated with the `#[classattr]` attribute.
+
+```rust,no_run
+# use pyo3::prelude::*;
+# #[pyclass]
+# struct MyClass {}
+#[pymethods]
+impl MyClass {
+    #[classattr]
+    const MY_ATTRIBUTE: &'static str = "foobar";
+}
+#
+# Python::attach(|py| {
+#    let my_class = py.get_type::<MyClass>();
+#    pyo3::py_run!(py, my_class, "assert my_class.MY_ATTRIBUTE == 'foobar'")
+# });
+```
+
+If `const` code is too limiting, a method without any arguments can be annotated with the `#[classattr]` attribute.
+
+> [!NOTE]
+> Here too, the class attribute value is computed once during the class creation and not each time the attribute is accessed.
 
 ```rust,no_run
 # use pyo3::prelude::*;
@@ -898,11 +920,11 @@ impl MyClass {
         "hello".to_string()
     }
 }
-
-Python::attach(|py| {
-    let my_class = py.get_type::<MyClass>();
-    pyo3::py_run!(py, my_class, "assert my_class.my_attribute == 'hello'")
-});
+#
+# Python::attach(|py| {
+#    let my_class = py.get_type::<MyClass>();
+#    pyo3::py_run!(py, my_class, "assert my_class.my_attribute == 'hello'")
+# });
 ```
 
 > [!NOTE]
@@ -911,19 +933,6 @@ class creation.
 
 > [!NOTE]
 > `#[classattr]` does not work with [`#[pyo3(warn(...))]`](./function.md#warn) attribute.
-
-If the class attribute is defined with `const` code only, one can also annotate associated constants:
-
-```rust,no_run
-# use pyo3::prelude::*;
-# #[pyclass]
-# struct MyClass {}
-#[pymethods]
-impl MyClass {
-    #[classattr]
-    const MY_CONST_ATTRIBUTE: &'static str = "foobar";
-}
-```
 
 ## Classes as function arguments
 
@@ -968,8 +977,8 @@ fn increment_then_print_field(my_class: &Bound<'_, MyClass>) {
 // When the Python object smart pointer needs to be stored elsewhere prefer `Py<T>` over `Bound<'py, T>`
 // to avoid the lifetime restrictions.
 #[pyfunction]
-fn print_refcnt(my_class: Py<MyClass>, py: Python<'_>) {
-    println!("{}", my_class.get_refcnt(py));
+fn print_is_none(my_class: Py<MyClass>, py: Python<'_>) {
+    println!("{}", my_class.is_none(py));
 }
 ```
 
@@ -1307,7 +1316,9 @@ Python::attach(|py| {
 })
 ```
 
-Ordering of enum variants is optionally added using `#[pyo3(ord)]`. *Note: Implementation of the `PartialOrd` trait is required when passing the `ord` argument.  If not implemented, a compile time error is raised.*
+Ordering of enum variants is optionally added using `#[pyo3(ord)]`.
+*Note: Implementation of the `PartialOrd` trait is required when passing the `ord` argument.*
+*If not implemented, a compile time error is raised.*
 
 ```rust
 # use pyo3::prelude::*;
@@ -1411,7 +1422,7 @@ Python::attach(|py| {
 ```
 
 WARNING: `Py::new` and `.into_pyobject` are currently inconsistent.
-Note how the constructed value is _not_ an instance of the specific variant.
+Note how the constructed value is *not* an instance of the specific variant.
 For this reason, constructing values is only recommended using `.into_pyobject`.
 
 ```rust
@@ -1481,7 +1492,8 @@ This implementation pattern enables the Rust compiler to use `#[pymethods]` impl
 
 This simple technique works for the case when there is zero or one implementations.
 To support multiple `#[pymethods]` for a `#[pyclass]` (in the [`multiple-pymethods`] feature), a registry mechanism provided by the [`inventory`](https://github.com/dtolnay/inventory) crate is used instead.
-This collects `impl`s at library load time, but isn't supported on all platforms. See [inventory: how it works](https://github.com/dtolnay/inventory#how-it-works) for more details.
+This collects `impl`s at library load time, but isn't supported on all platforms.
+See [inventory: how it works](https://github.com/dtolnay/inventory#how-it-works) for more details.
 
 The `#[pyclass]` macro expands to roughly the code seen below.
 The `PyClassImplCollector` is the type used internally by PyO3 for dtolnay specialization:

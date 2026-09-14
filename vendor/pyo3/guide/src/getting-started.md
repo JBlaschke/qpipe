@@ -9,7 +9,7 @@ We'll cover each of these below.
 ## Rust
 
 First, make sure you have Rust installed on your system.
-If you haven't already done so, try following the instructions [here](https://www.rust-lang.org/tools/install).
+If you haven't already done so, try following the instructions [on the Rust website](https://www.rust-lang.org/tools/install).
 PyO3 runs on both the `stable` and `nightly` versions so you can choose whichever one fits you best.
 The minimum required Rust version is 1.83.
 
@@ -17,13 +17,13 @@ If you can run `rustc --version` and the version is new enough you're good to go
 
 ## Python
 
-To use PyO3, you need at least Python 3.7.
+To use PyO3, you need at least Python 3.8.
 While you can simply use the default Python interpreter on your system, it is recommended to use a virtual environment.
 
 ## Virtualenvs
 
 While you can use any virtualenv manager you like, we recommend the use of `pyenv` in particular if you want to develop or test for multiple different Python versions, so that is what the examples in this book will use.
-The installation instructions for `pyenv` can be found [here](https://github.com/pyenv/pyenv#a-getting-pyenv). (Note: To get the `pyenv activate` and `pyenv virtualenv` commands, you will also need to install the [`pyenv-virtualenv`](https://github.com/pyenv/pyenv-virtualenv) plugin.
+The installation instructions for `pyenv` can be found [in the `pyenv` GitHub repository](https://github.com/pyenv/pyenv#a-getting-pyenv). (Note: To get the `pyenv activate` and `pyenv virtualenv` commands, you will also need to install the [`pyenv-virtualenv`](https://github.com/pyenv/pyenv-virtualenv) plugin.
 The [pyenv installer](https://github.com/pyenv/pyenv-installer#installation--update--uninstallation) will install both together.)
 
 It can be useful to keep the sources used when installing using `pyenv` so that future debugging can see the original source files.
@@ -38,7 +38,7 @@ pyenv install 3.12 --keep
 ### Building
 
 There are a number of build and Python package management systems such as [`setuptools-rust`](https://github.com/PyO3/setuptools-rust) or [manually](./building-and-distribution.md#manual-builds).
-We recommend the use of `maturin`, which you can install [here](https://maturin.rs/installation.html).
+We recommend the use of `maturin`, which you can install [as per the `maturin` documentation](https://maturin.rs/installation.html).
 It is developed to work with PyO3 and provides the most "batteries included" experience, especially if you are aiming to publish to PyPI.
 `maturin` is just a Python package, so you can add it in the same way you already install Python packages.
 
@@ -153,7 +153,7 @@ build-backend = "maturin"
 
 [project]
 name = "pyo3_example"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -191,6 +191,9 @@ $ python
 >>> pyo3_example.sum_as_string(5, 20)
 '25'
 ```
+
+By default, `maturin develop` builds your Rust code with Cargo's default [`dev` profile](https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles), which includes debug information and limited optimizations.
+When checking runtime performance, run `maturin develop --release` to build with Cargo's `release` profile and enable optimizations.
 
 For more instructions on how to use Python code from Rust, see the [Python from Rust](python-from-rust.md) page.
 

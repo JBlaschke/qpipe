@@ -140,12 +140,15 @@ pub fn impl_arg_params(
 
     let extract_expression = if fastcall {
         quote! {
-            DESCRIPTION.extract_arguments_fastcall::<#args_handler, #kwargs_handler>(
+            #pyo3_path::impl_::pymethods::maybe_extract_arguments_fastcall!(
+                DESCRIPTION,
                 py,
                 _args,
                 _nargs,
-                _kwnames,
-                &mut #args_array
+                _kwargs,
+                #args_array,
+                #args_handler,
+                #kwargs_handler
             )?
         }
     } else {
@@ -220,8 +223,14 @@ fn impl_arg_param(
                 )?
             }
         }
-        FnArg::Py(..) => quote! { py },
-        FnArg::CancelHandle(..) => quote! { __cancel_handle },
+        FnArg::Py(arg) => {
+            let span = Span::call_site().located_at(arg.ty.span());
+            quote_spanned! { span => py }
+        }
+        FnArg::CancelHandle(arg) => {
+            let span = Span::call_site().located_at(arg.ty.span());
+            quote_spanned! { span => __cancel_handle }
+        }
     }
 }
 
@@ -256,7 +265,7 @@ pub(crate) fn impl_regular_arg_param(
         default = default.map(|tokens| some_wrap(tokens, ctx));
     }
 
-    if let Some(FromPyWithAttribute { kw, .. }) = arg.from_py_with {
+    if let Some(FromPyWithAttribute { kw, .. }) = &arg.from_py_with.as_deref() {
         let extractor = quote_spanned! { kw.span =>
             { let from_py_with: fn(_) -> _ = #from_py_with; from_py_with }
         };
@@ -283,7 +292,7 @@ pub(crate) fn impl_regular_arg_param(
             }
         }
     } else if let Some(default) = default {
-        let holder = holders.push_holder(arg.name.span());
+        let holder = holders.push_holder(arg.ty.span());
         quote_arg_span! {
             #pyo3_path::impl_::extract_argument::extract_argument_with_default(
                 #arg_value,
@@ -296,8 +305,8 @@ pub(crate) fn impl_regular_arg_param(
             )?
         }
     } else {
-        let holder = holders.push_holder(arg.name.span());
-        let unwrap = quote! {unsafe { #pyo3_path::impl_::extract_argument::unwrap_required_argument(#arg_value) }};
+        let holder = holders.push_holder(arg.ty.span());
+        let unwrap = quote! { unsafe { #pyo3_path::impl_::extract_argument::unwrap_required_argument(#arg_value) } };
         quote_arg_span! {
             #pyo3_path::impl_::extract_argument::extract_argument(
                 #unwrap,

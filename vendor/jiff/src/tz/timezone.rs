@@ -1,3 +1,5 @@
+use jcore::tz::{posix, tzif};
+
 use crate::{
     civil::DateTime,
     error::{tz::timezone::Error as E, Error},
@@ -5,11 +7,9 @@ use crate::{
         ambiguous::{AmbiguousOffset, AmbiguousTimestamp, AmbiguousZoned},
         offset::{Dst, Offset},
     },
-    util::{array_str::ArrayStr, sync::Arc},
+    util::sync::Arc,
     Timestamp, Zoned,
 };
-
-use crate::tz::posix::PosixTimeZoneOwned;
 
 use self::repr::Repr;
 
@@ -504,14 +504,15 @@ impl TimeZone {
     /// ```
     #[cfg(feature = "alloc")]
     pub fn posix(posix_tz_string: &str) -> Result<TimeZone, Error> {
-        let posix_tz = PosixTimeZoneOwned::parse(posix_tz_string)?;
+        let posix_tz = posix::TimeZone::parse(posix_tz_string)
+            .map_err(Error::jcore_posix_parse)?;
         Ok(TimeZone::from_posix_tz(posix_tz))
     }
 
     /// Creates a time zone from a POSIX tz. Expose so that other parts of Jiff
     /// can create a `TimeZone` from a POSIX tz. (Kinda sloppy to be honest.)
     #[cfg(feature = "alloc")]
-    pub(crate) fn from_posix_tz(posix: PosixTimeZoneOwned) -> TimeZone {
+    pub(crate) fn from_posix_tz(posix: posix::TimeZone) -> TimeZone {
         let repr = Repr::arc_posix(Arc::new(posix));
         TimeZone { repr }
     }
@@ -535,10 +536,10 @@ impl TimeZone {
     /// TZif.
     #[cfg(feature = "alloc")]
     pub fn tzif(name: &str, data: &[u8]) -> Result<TimeZone, Error> {
-        use alloc::string::ToString;
-
-        let name = name.to_string();
-        let tzif = crate::tz::tzif::Tzif::parse(Some(name), data)?;
+        let name = jcore::tz::TimeZoneId::new_or_heap(name);
+        let tzif = tzif::TimeZone::parse(data)
+            .map_err(Error::jcore_tzif_parse)?
+            .into_named(name);
         let repr = Repr::arc_tzif(Arc::new(tzif));
         Ok(TimeZone { repr })
     }
@@ -616,7 +617,9 @@ impl TimeZone {
     /// This returns an error if the given TZif data is invalid.
     #[cfg(feature = "tz-system")]
     pub(crate) fn tzif_system(data: &[u8]) -> Result<TimeZone, Error> {
-        let tzif = crate::tz::tzif::Tzif::parse(None, data)?;
+        let tzif = tzif::TimeZone::parse(data)
+            .map_err(Error::jcore_tzif_parse)?
+            .into_maybe_named(None);
         let repr = Repr::arc_tzif(Arc::new(tzif));
         Ok(TimeZone { repr })
     }
@@ -710,7 +713,7 @@ impl TimeZone {
     /// zones). Instead, this only returns something when the actual
     /// representation of the time zone is a POSIX time zone.
     #[inline]
-    pub(crate) fn posix_tz(&self) -> Option<&PosixTimeZoneOwned> {
+    pub(crate) fn posix_tz(&self) -> Option<&posix::TimeZone> {
         repr::each! {
             &self.repr,
             UTC => None,
@@ -804,9 +807,15 @@ impl TimeZone {
             UTC => Offset::UTC,
             UNKNOWN => Offset::UTC,
             FIXED(offset) => offset,
-            STATIC_TZIF(tzif) => tzif.to_offset(timestamp),
-            ARC_TZIF(tzif) => tzif.to_offset(timestamp),
-            ARC_POSIX(posix) => posix.to_offset(timestamp),
+            STATIC_TZIF(tzif) => Offset::from_jcore(
+                tzif.tz().to_offset(timestamp.to_jcore()),
+            ),
+            ARC_TZIF(tzif) => Offset::from_jcore(
+                tzif.tz().to_offset(timestamp.to_jcore()),
+            ),
+            ARC_POSIX(posix) => Offset::from_jcore(
+                posix.to_offset(timestamp.to_jcore()),
+            ),
         }
     }
 
@@ -854,12 +863,15 @@ impl TimeZone {
         &'t self,
         timestamp: Timestamp,
     ) -> TimeZoneOffsetInfo<'t> {
+        static UTC: jcore::tz::Abbreviation =
+            jcore::tz::Abbreviation::array("UTC");
         repr::each! {
             &self.repr,
             UTC => TimeZoneOffsetInfo {
                 offset: Offset::UTC,
                 dst: Dst::No,
-                abbreviation: TimeZoneAbbreviation::Borrowed("UTC"),
+                abbreviation: UTC.clone(),
+                vestigial_lifetime: core::marker::PhantomData,
             },
             UNKNOWN => TimeZoneOffsetInfo {
                 offset: Offset::UTC,
@@ -868,20 +880,28 @@ impl TimeZone {
                 // indicate an error, but I can't find any precedent
                 // for that. And CLDR says `Etc/Unknown` should behave
                 // like UTC, so... I guess we use UTC here.
-                abbreviation: TimeZoneAbbreviation::Borrowed("UTC"),
+                abbreviation: UTC.clone(),
+                vestigial_lifetime: core::marker::PhantomData,
             },
             FIXED(offset) => {
                 let abbreviation =
-                    TimeZoneAbbreviation::Owned(offset.to_array_str());
+                    offset.to_abbreviation();
                 TimeZoneOffsetInfo {
                     offset,
                     dst: Dst::No,
                     abbreviation,
+                    vestigial_lifetime: core::marker::PhantomData,
                 }
             },
-            STATIC_TZIF(tzif) => tzif.to_offset_info(timestamp),
-            ARC_TZIF(tzif) => tzif.to_offset_info(timestamp),
-            ARC_POSIX(posix) => posix.to_offset_info(timestamp),
+            STATIC_TZIF(tzif) => TimeZoneOffsetInfo::from_jcore(
+                tzif.tz().to_offset_info(timestamp.to_jcore()),
+            ),
+            ARC_TZIF(tzif) => TimeZoneOffsetInfo::from_jcore(
+                tzif.tz().to_offset_info(timestamp.to_jcore()),
+            ),
+            ARC_POSIX(posix) => TimeZoneOffsetInfo::from_jcore(
+                posix.to_offset_info(timestamp.to_jcore()),
+            ),
         }
     }
 
@@ -1180,9 +1200,15 @@ impl TimeZone {
             UTC => AmbiguousOffset::Unambiguous { offset: Offset::UTC },
             UNKNOWN => AmbiguousOffset::Unambiguous { offset: Offset::UTC },
             FIXED(offset) => AmbiguousOffset::Unambiguous { offset },
-            STATIC_TZIF(tzif) => tzif.to_ambiguous_kind(dt),
-            ARC_TZIF(tzif) => tzif.to_ambiguous_kind(dt),
-            ARC_POSIX(posix) => posix.to_ambiguous_kind(dt),
+            STATIC_TZIF(tzif) => AmbiguousOffset::from_jcore(
+                tzif.tz().to_ambiguous_timestamp(dt.to_jcore()).offset(),
+            ),
+            ARC_TZIF(tzif) => AmbiguousOffset::from_jcore(
+                tzif.tz().to_ambiguous_timestamp(dt.to_jcore()).offset()
+            ),
+            ARC_POSIX(posix) => AmbiguousOffset::from_jcore(
+                posix.to_ambiguous_timestamp(dt.to_jcore()).offset(),
+            ),
         };
         AmbiguousTimestamp::new(dt, ambiguous_kind)
     }
@@ -1358,9 +1384,20 @@ impl TimeZone {
             UTC => None,
             UNKNOWN => None,
             FIXED(_offset) => None,
-            STATIC_TZIF(tzif) => tzif.previous_transition(timestamp),
-            ARC_TZIF(tzif) => tzif.previous_transition(timestamp),
-            ARC_POSIX(posix) => posix.previous_transition(timestamp),
+            STATIC_TZIF(tzif) => {
+                tzif.tz()
+                    .previous_transition(timestamp.to_jcore())
+                    .map(TimeZoneTransition::from_jcore)
+            },
+            ARC_TZIF(tzif) => {
+                tzif.tz()
+                    .previous_transition(timestamp.to_jcore())
+                    .map(TimeZoneTransition::from_jcore)
+            },
+            ARC_POSIX(posix) => {
+                posix.previous_transition(timestamp.to_jcore())
+                    .map(TimeZoneTransition::from_jcore)
+            },
         }
     }
 
@@ -1375,9 +1412,20 @@ impl TimeZone {
             UTC => None,
             UNKNOWN => None,
             FIXED(_offset) => None,
-            STATIC_TZIF(tzif) => tzif.next_transition(timestamp),
-            ARC_TZIF(tzif) => tzif.next_transition(timestamp),
-            ARC_POSIX(posix) => posix.next_transition(timestamp),
+            STATIC_TZIF(tzif) => {
+                tzif.tz()
+                    .next_transition(timestamp.to_jcore())
+                    .map(TimeZoneTransition::from_jcore)
+            },
+            ARC_TZIF(tzif) => {
+                tzif.tz()
+                    .next_transition(timestamp.to_jcore())
+                    .map(TimeZoneTransition::from_jcore)
+            },
+            ARC_POSIX(posix) => {
+                posix.next_transition(timestamp.to_jcore())
+                    .map(TimeZoneTransition::from_jcore)
+            },
         }
     }
 
@@ -1395,6 +1443,28 @@ impl TimeZone {
             ARC_POSIX(_posix) => "POSIX",
         }
     }
+
+    /// Returns the heap memory usage, in bytes, of this timezone.
+    ///
+    /// This does **not** include the stack size used up by this timezone.
+    /// To compute that, use `std::mem::size_of::<TimeZone>()`.
+    pub fn memory_usage(&self) -> usize {
+        repr::each! {
+            &self.repr,
+            UTC => 0,
+            UNKNOWN => 0,
+            FIXED(_offset) => 0,
+            STATIC_TZIF(_tzif) => 0,
+            ARC_TZIF(_tzif) => {
+                core::mem::size_of::<tzif::MaybeNamedTimeZone>() +
+                (core::mem::size_of::<core::sync::atomic::AtomicUsize>() * 2)
+            },
+            ARC_POSIX(_posix) => {
+                core::mem::size_of::<posix::TimeZone>() +
+                (core::mem::size_of::<core::sync::atomic::AtomicUsize>() * 2)
+            },
+        }
+    }
 }
 
 // Exposed APIs for Jiff's time zone proc macro.
@@ -1403,8 +1473,9 @@ impl TimeZone {
 // for them.
 #[doc(hidden)]
 impl TimeZone {
+    /// Constructs a `TimeZone` from a static TZif time zone from jcore.
     pub const fn __internal_from_tzif(
-        tzif: &'static crate::tz::tzif::TzifStatic,
+        tzif: &'static tzif::MaybeNamedTimeZone,
     ) -> TimeZone {
         let repr = Repr::static_tzif(tzif);
         TimeZone { repr }
@@ -1432,6 +1503,41 @@ impl core::fmt::Debug for TimeZone {
     #[inline]
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_tuple("TimeZone").field(&self.repr).finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for TimeZone {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "TimeZone({})", self.repr);
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> arbitrary::Arbitrary<'a> for TimeZone {
+    fn arbitrary(
+        u: &mut arbitrary::Unstructured<'a>,
+    ) -> arbitrary::Result<TimeZone> {
+        #[cfg(feature = "alloc")]
+        {
+            if bool::arbitrary(u)? {
+                let names: alloc::vec::Vec<_> =
+                    crate::tz::db().available().collect();
+                if let Ok(name) = u.choose(&names) {
+                    if let Ok(tz) = crate::tz::db().get(name.as_str()) {
+                        return Ok(tz);
+                    }
+                }
+            }
+        }
+        Ok(TimeZone::fixed(Offset::arbitrary(u)?))
+    }
+
+    fn size_hint(depth: usize) -> (usize, Option<usize>) {
+        arbitrary::size_hint::and(
+            <bool as arbitrary::Arbitrary>::size_hint(depth),
+            <Offset as arbitrary::Arbitrary>::size_hint(depth),
+        )
     }
 }
 
@@ -1489,8 +1595,9 @@ pub struct TimeZoneTransition<'t> {
     // kind of optimization in the future.
     pub(crate) timestamp: Timestamp,
     pub(crate) offset: Offset,
-    pub(crate) abbrev: &'t str,
+    pub(crate) abbreviation: jcore::tz::Abbreviation,
     pub(crate) dst: Dst,
+    pub(crate) vestigial_lifetime: core::marker::PhantomData<&'t ()>,
 }
 
 impl<'t> TimeZoneTransition<'t> {
@@ -1579,7 +1686,7 @@ impl<'t> TimeZoneTransition<'t> {
     /// ```
     #[inline]
     pub fn abbreviation<'a>(&'a self) -> &'a str {
-        self.abbrev
+        self.abbreviation.as_str()
     }
 
     /// Returns whether daylight saving time is enabled for this time zone
@@ -1610,6 +1717,23 @@ impl<'t> TimeZoneTransition<'t> {
     #[inline]
     pub fn dst(&self) -> Dst {
         self.dst
+    }
+
+    pub(crate) fn from_jcore(
+        trans: jcore::tz::Transition,
+    ) -> TimeZoneTransition<'static> {
+        let timestamp = Timestamp::from_jcore(trans.timestamp());
+        let offset = Offset::from_jcore(trans.offset());
+        let dst = Dst::from_jcore(trans.dst());
+        let abbreviation = trans.into_offset_info().into_abbreviation();
+        let vestigial_lifetime = core::marker::PhantomData;
+        TimeZoneTransition {
+            timestamp,
+            offset,
+            dst,
+            abbreviation,
+            vestigial_lifetime,
+        }
     }
 }
 
@@ -1673,7 +1797,8 @@ impl<'t> TimeZoneTransition<'t> {
 pub struct TimeZoneOffsetInfo<'t> {
     pub(crate) offset: Offset,
     pub(crate) dst: Dst,
-    pub(crate) abbreviation: TimeZoneAbbreviation<'t>,
+    pub(crate) abbreviation: jcore::tz::Abbreviation,
+    pub(crate) vestigial_lifetime: core::marker::PhantomData<&'t ()>,
 }
 
 impl<'t> TimeZoneOffsetInfo<'t> {
@@ -1760,6 +1885,16 @@ impl<'t> TimeZoneOffsetInfo<'t> {
     #[inline]
     pub fn dst(&self) -> Dst {
         self.dst
+    }
+
+    pub(crate) fn from_jcore(
+        info: jcore::tz::OffsetInfo,
+    ) -> TimeZoneOffsetInfo<'static> {
+        let offset = Offset::from_jcore(info.offset());
+        let dst = Dst::from_jcore(info.dst());
+        let abbreviation = info.into_abbreviation();
+        let vestigial_lifetime = core::marker::PhantomData;
+        TimeZoneOffsetInfo { offset, dst, abbreviation, vestigial_lifetime }
     }
 }
 
@@ -1882,47 +2017,13 @@ impl<'a> core::fmt::Display for DiagnosticName<'a> {
             UTC => f.write_str("UTC"),
             UNKNOWN => f.write_str("Etc/Unknown"),
             FIXED(offset) => offset.fmt(f),
-            STATIC_TZIF(tzif) => f.write_str(tzif.name().unwrap_or("Local")),
-            ARC_TZIF(tzif) => f.write_str(tzif.name().unwrap_or("Local")),
-            ARC_POSIX(posix) => posix.fmt(f),
-        }
-    }
-}
-
-/// A light abstraction over different representations of a time zone
-/// abbreviation.
-///
-/// The lifetime parameter `'t` corresponds to the lifetime of the time zone
-/// that produced this abbreviation.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub(crate) enum TimeZoneAbbreviation<'t> {
-    /// For when the abbreviation is borrowed directly from other data. For
-    /// example, from TZif or from POSIX TZ strings.
-    Borrowed(&'t str),
-    /// For when the abbreviation has to be derived from other data. For
-    /// example, from a fixed offset.
-    ///
-    /// The idea here is that a `TimeZone` shouldn't need to store the
-    /// string representation of a fixed offset. Particularly in core-only
-    /// environments, this is quite wasteful. So we make the string on-demand
-    /// only when it's requested.
-    ///
-    /// An alternative design is to just implement `Display` and reuse
-    /// `Offset`'s `Display` impl, but then we couldn't offer a `-> &str` API.
-    /// I feel like that's just a bit overkill, and really just comes from the
-    /// core-only straight-jacket.
-    Owned(ArrayStr<9>),
-}
-
-impl<'t> TimeZoneAbbreviation<'t> {
-    /// Returns this abbreviation as a string borrowed from `self`.
-    ///
-    /// Notice that, like `Cow`, the lifetime of the string returned is
-    /// tied to `self` and thus may be shorter than `'t`.
-    fn as_str<'a>(&'a self) -> &'a str {
-        match *self {
-            TimeZoneAbbreviation::Borrowed(s) => s,
-            TimeZoneAbbreviation::Owned(ref s) => s.as_str(),
+            STATIC_TZIF(tzif) => f.write_str(
+                tzif.name().unwrap_or("Local"),
+            ),
+            ARC_TZIF(tzif) => f.write_str(
+                tzif.name().unwrap_or("Local"),
+            ),
+            ARC_POSIX(posix) => crate::tz::posix::TimeZoneFormatter(posix).fmt(f),
         }
     }
 }
@@ -1938,12 +2039,11 @@ impl<'t> TimeZoneAbbreviation<'t> {
 mod repr {
     use core::mem::ManuallyDrop;
 
-    use crate::{tz::tzif::TzifStatic, util::constant::unwrap};
+    use jcore::tz::{posix, tzif};
+
+    use crate::util::constant::unwrap;
     #[cfg(feature = "alloc")]
-    use crate::{
-        tz::{posix::PosixTimeZoneOwned, tzif::TzifOwned},
-        util::sync::Arc,
-    };
+    use crate::util::sync::Arc;
 
     use super::Offset;
 
@@ -2081,9 +2181,14 @@ mod repr {
         ///
         /// This can only be correctly called by the `jiff-static` proc macro.
         #[inline]
-        pub(super) const fn static_tzif(tzif: &'static TzifStatic) -> Repr {
-            assert!(core::mem::align_of::<TzifStatic>() >= Repr::ALIGN);
-            let tzif = (tzif as *const TzifStatic).cast::<u8>();
+        pub(super) const fn static_tzif(
+            tzif: &'static tzif::MaybeNamedTimeZone,
+        ) -> Repr {
+            assert!(
+                core::mem::align_of::<tzif::MaybeNamedTimeZone>()
+                    >= Repr::ALIGN
+            );
+            let tzif = (tzif as *const tzif::MaybeNamedTimeZone).cast::<u8>();
             // We very specifically do no materialize the pointer address here
             // because 1) it's UB and 2) the compiler generally prevents. This
             // is because in a const context, the specific pointer address
@@ -2106,8 +2211,11 @@ mod repr {
         /// Creates a representation for a TZif time zone.
         #[cfg(feature = "alloc")]
         #[inline]
-        pub(super) fn arc_tzif(tzif: Arc<TzifOwned>) -> Repr {
-            assert!(core::mem::align_of::<TzifOwned>() >= Repr::ALIGN);
+        pub(super) fn arc_tzif(tzif: Arc<tzif::MaybeNamedTimeZone>) -> Repr {
+            assert!(
+                core::mem::align_of::<tzif::MaybeNamedTimeZone>()
+                    >= Repr::ALIGN
+            );
             let tzif = Arc::into_raw(tzif).cast::<u8>();
             assert!(tzif.addr() % 4 == 0);
             let ptr = tzif.map_addr(|addr| addr | Repr::ARC_TZIF);
@@ -2117,10 +2225,8 @@ mod repr {
         /// Creates a representation for a POSIX time zone.
         #[cfg(feature = "alloc")]
         #[inline]
-        pub(super) fn arc_posix(posix_tz: Arc<PosixTimeZoneOwned>) -> Repr {
-            assert!(
-                core::mem::align_of::<PosixTimeZoneOwned>() >= Repr::ALIGN
-            );
+        pub(super) fn arc_posix(posix_tz: Arc<posix::TimeZone>) -> Repr {
+            assert!(core::mem::align_of::<posix::TimeZone>() >= Repr::ALIGN);
             let posix_tz = Arc::into_raw(posix_tz).cast::<u8>();
             assert!(posix_tz.addr() % 4 == 0);
             let ptr = posix_tz.map_addr(|addr| addr | Repr::ARC_POSIX);
@@ -2154,7 +2260,9 @@ mod repr {
         ///
         /// Callers must ensure that the pointer tag is `STATIC_TZIF`.
         #[inline]
-        pub(super) unsafe fn get_static_tzif(&self) -> &'static TzifStatic {
+        pub(super) unsafe fn get_static_tzif(
+            &self,
+        ) -> &'static tzif::MaybeNamedTimeZone {
             #[allow(unstable_name_collisions)]
             let ptr = self.ptr.map_addr(|addr| addr & !Repr::BITS);
             // SAFETY: Getting a `STATIC_TZIF` tag is only possible when
@@ -2162,7 +2270,7 @@ mod repr {
             // 4 bytes) `&TzifStatic` borrow. Which must be guaranteed by the
             // caller. We've also removed the tag bits above, so we must now
             // have the original pointer.
-            unsafe { &*ptr.cast::<TzifStatic>() }
+            unsafe { &*ptr.cast::<tzif::MaybeNamedTimeZone>() }
         }
 
         /// Gets the `Arc` TZif representation.
@@ -2172,15 +2280,16 @@ mod repr {
         /// Callers must ensure that the pointer tag is `ARC_TZIF`.
         #[cfg(feature = "alloc")]
         #[inline]
-        pub(super) unsafe fn get_arc_tzif<'a>(&'a self) -> &'a TzifOwned {
+        pub(super) unsafe fn get_arc_tzif<'a>(
+            &'a self,
+        ) -> &'a tzif::MaybeNamedTimeZone {
             let ptr = self.ptr.map_addr(|addr| addr & !Repr::BITS);
             // SAFETY: Getting a `ARC_TZIF` tag is only possible when
-            // `self.ptr` was constructed from a valid and aligned
-            // (to at least 4 bytes) `Arc<TzifOwned>`. We've removed
-            // the tag bits above, so we must now have the original
-            // pointer.
+            // `self.ptr` was constructed from a valid and aligned (to at least
+            // 4 bytes) `Arc<tzif::MaybeNamedTimeZone>`. We've removed the tag
+            // bits above, so we must now have the original pointer.
             let arc = ManuallyDrop::new(unsafe {
-                Arc::from_raw(ptr.cast::<TzifOwned>())
+                Arc::from_raw(ptr.cast::<tzif::MaybeNamedTimeZone>())
             });
             // SAFETY: The lifetime of the pointer returned is always
             // valid as long as the strong count on `arc` is at least
@@ -2200,14 +2309,14 @@ mod repr {
         #[inline]
         pub(super) unsafe fn get_arc_posix<'a>(
             &'a self,
-        ) -> &'a PosixTimeZoneOwned {
+        ) -> &'a posix::TimeZone {
             let ptr = self.ptr.map_addr(|addr| addr & !Repr::BITS);
             // SAFETY: Getting a `ARC_POSIX` tag is only possible when
             // `self.ptr` was constructed from a valid and aligned (to at least
-            // 4 bytes) `Arc<PosixTimeZoneOwned>`. We've removed the tag
-            // bits above, so we must now have the original pointer.
+            // 4 bytes) `Arc<jcore::tz::posix::TimeZone>`. We've removed the
+            // tag bits above, so we must now have the original pointer.
             let arc = ManuallyDrop::new(unsafe {
-                Arc::from_raw(ptr.cast::<PosixTimeZoneOwned>())
+                Arc::from_raw(ptr.cast::<posix::TimeZone>())
             });
             // SAFETY: The lifetime of the pointer returned is always
             // valid as long as the strong count on `arc` is at least
@@ -2278,7 +2387,10 @@ mod repr {
                 },
                 ARC_POSIX(posix) => {
                     f.write_str("Posix(")?;
-                    core::fmt::Display::fmt(&posix, f)?;
+                    core::fmt::Display::fmt(
+                        &crate::tz::posix::TimeZoneFormatter(posix),
+                        f,
+                    )?;
                     f.write_str(")")
                 },
             }
@@ -2300,12 +2412,14 @@ mod repr {
                 Repr::ARC_TZIF => {
                     let ptr = self.ptr.map_addr(|addr| addr & !Repr::BITS);
                     // SAFETY: Getting a `ARC_TZIF` tag is only possible when
-                    // `self.ptr` was constructed from a valid and aligned
-                    // (to at least 4 bytes) `Arc<TzifOwned>`. We've removed
-                    // the tag bits above, so we must now have the original
-                    // pointer.
+                    // `self.ptr` was constructed from a valid and aligned (to
+                    // at least 4 bytes) `Arc<tzif::MaybeNamedTimeZone>`. We've
+                    // removed the tag bits above, so we must now have the
+                    // original pointer.
                     unsafe {
-                        Arc::increment_strong_count(ptr.cast::<TzifOwned>());
+                        Arc::increment_strong_count(
+                            ptr.cast::<tzif::MaybeNamedTimeZone>(),
+                        );
                     }
                     Repr { ptr: self.ptr }
                 }
@@ -2314,12 +2428,12 @@ mod repr {
                     let ptr = self.ptr.map_addr(|addr| addr & !Repr::BITS);
                     // SAFETY: Getting a `ARC_POSIX` tag is only possible when
                     // `self.ptr` was constructed from a valid and aligned (to
-                    // at least 4 bytes) `Arc<PosixTimeZoneOwned>`. We've
-                    // removed the tag bits above, so we must now have the
-                    // original pointer.
+                    // at least 4 bytes) `Arc<jcore::tz::posix::TimeZone>`.
+                    // We've removed the tag bits above, so we must now have
+                    // the original pointer.
                     unsafe {
                         Arc::increment_strong_count(
-                            ptr.cast::<PosixTimeZoneOwned>(),
+                            ptr.cast::<posix::TimeZone>(),
                         );
                     }
                     Repr { ptr: self.ptr }
@@ -2350,13 +2464,16 @@ mod repr {
                 #[cfg(feature = "alloc")]
                 Repr::ARC_TZIF => {
                     let ptr = self.ptr.map_addr(|addr| addr & !Repr::BITS);
-                    // SAFETY: Getting a `ARC_TZIF` tag is only possible when
-                    // `self.ptr` was constructed from a valid and aligned
-                    // (to at least 4 bytes) `Arc<TzifOwned>`. We've removed
-                    // the tag bits above, so we must now have the original
+                    // SAFETY: Getting a `ARC_TZIF` tag is only
+                    // possible when `self.ptr` was constructed from
+                    // a valid and aligned (to at least 4 bytes)
+                    // `Arc<tzif::MaybeNamedTimeZone>`. We've removed the tag
+                    // bits above, so we must now have the original
                     // pointer.
                     unsafe {
-                        Arc::decrement_strong_count(ptr.cast::<TzifOwned>());
+                        Arc::decrement_strong_count(
+                            ptr.cast::<tzif::MaybeNamedTimeZone>(),
+                        );
                     }
                 }
                 #[cfg(feature = "alloc")]
@@ -2364,12 +2481,12 @@ mod repr {
                     let ptr = self.ptr.map_addr(|addr| addr & !Repr::BITS);
                     // SAFETY: Getting a `ARC_POSIX` tag is only possible when
                     // `self.ptr` was constructed from a valid and aligned (to
-                    // at least 4 bytes) `Arc<PosixTimeZoneOwned>`. We've
-                    // removed the tag bits above, so we must now have the
-                    // original pointer.
+                    // at least 4 bytes) `Arc<jcore::tz::posix::TimeZone>`.
+                    // We've removed the tag bits above, so we must now have
+                    // the original pointer.
                     unsafe {
                         Arc::decrement_strong_count(
-                            ptr.cast::<PosixTimeZoneOwned>(),
+                            ptr.cast::<posix::TimeZone>(),
                         );
                     }
                 }
@@ -2408,6 +2525,35 @@ mod repr {
                 // SAFETY: OK, because we know the tags are equivalent and
                 // `self` has an `ARC_POSIX` tag.
                 ARC_POSIX(posix) => posix == unsafe { other.get_arc_posix() },
+            }
+        }
+    }
+
+    #[cfg(feature = "defmt")]
+    impl defmt::Format for Repr {
+        fn format(&self, f: defmt::Formatter) {
+            each! {
+                self,
+                UTC => defmt::write!(f, "UTC"),
+                UNKNOWN => defmt::write!(f, "Etc/Unknown"),
+                FIXED(offset) => defmt::write!(f, "{}", offset),
+                STATIC_TZIF(tzif) => {
+                    // The full debug output is a bit much, so constrain it.
+                    let field = tzif.name().unwrap_or("Local");
+                    defmt::write!(f, "TZif({=str})", field)
+                },
+                ARC_TZIF(tzif) => {
+                    // The full debug output is a bit much, so constrain it.
+                    let field = tzif.name().unwrap_or("Local");
+                    defmt::write!(f, "TZif({=str})", field)
+                },
+                ARC_POSIX(posix) => {
+                    defmt::write!(
+                        f,
+                        "Posix({})",
+                        crate::tz::posix::TimeZoneFormatter(&posix),
+                    )
+                },
             }
         }
     }

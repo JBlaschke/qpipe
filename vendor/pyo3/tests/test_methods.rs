@@ -44,6 +44,22 @@ fn instance_method() {
     });
 }
 
+/// Test that CPython's method-wrapper descriptor rejects wrong receiver types
+/// when `tp_methods` entries are called with a bad `self` from Python.
+/// This validates that the trusted self conversion in generated wrappers is safe:
+/// even though the Rust code skips a runtime type check, CPython enforces the
+/// receiver type before the C function is reached.
+#[test]
+fn tp_methods_receiver_type_checked_by_cpython() {
+    Python::attach(|py| {
+        let cls = py.get_type::<InstanceMethod>();
+        // Calling an unbound method with a wrong-type `self` raises TypeError.
+        // CPython's method-wrapper descriptor enforces the type before our Rust
+        // wrapper is invoked.
+        py_expect_exception!(py, cls, "cls.method(object())", PyTypeError);
+    });
+}
+
 #[pyclass]
 struct InstanceMethodWithArgs {
     member: i32,
@@ -104,6 +120,63 @@ fn class_method() {
         );
         py_assert!(py, *d, "C.method.__doc__ == 'Test class method.'");
         py_assert!(py, *d, "C().method.__doc__ == 'Test class method.'");
+    });
+}
+
+#[test]
+fn class_method_magic_methods() {
+    #[pyclass(subclass)]
+    struct ClassMethodMagic;
+
+    #[pymethods]
+    impl ClassMethodMagic {
+        #[new]
+        fn new() -> Self {
+            Self
+        }
+
+        #[classmethod]
+        fn __len__(cls: &Bound<'_, PyType>) -> usize {
+            if cls.is_exact_instance_of::<PyType>() {
+                42
+            } else {
+                0
+            }
+        }
+
+        #[classmethod]
+        fn __call__<'py>(cls: &Bound<'py, PyType>) -> Bound<'py, PyType> {
+            cls.clone()
+        }
+
+        #[classmethod]
+        fn __add__<'py>(cls: &Bound<'py, PyType>, _other: &Bound<'_, PyAny>) -> Bound<'py, PyType> {
+            cls.clone()
+        }
+    }
+
+    Python::attach(|py| {
+        let cls = py.get_type::<ClassMethodMagic>();
+        py_run!(
+            py,
+            cls,
+            r#"
+class Subclass(cls):
+    pass
+
+obj = Subclass()
+assert len(obj) == 42
+assert obj() is Subclass
+assert obj + None is Subclass
+
+try:
+    1 + obj
+except TypeError:
+    pass
+else:
+    raise AssertionError("the forward operator accepted the wrong receiver")
+"#
+        );
     });
 }
 

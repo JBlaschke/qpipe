@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.83"
 name = "pyo3-macros"
-version = "0.28.3"
+version = "0.29.2"
 authors = ["PyO3 Project and Contributors <https://github.com/PyO3>"]
 build = false
 autolib = false
@@ -52,7 +52,7 @@ version = "1.0.60"
 default-features = false
 
 [dependencies.pyo3-macros-backend]
-version = "=0.28.3"
+version = "=0.29.2"
 
 [dependencies.quote]
 version = "1"
@@ -75,7 +75,7 @@ let_unit_value = "warn"
 manual_assert = "warn"
 manual_ok_or = "warn"
 todo = "warn"
-undocumented_unsafe_blocks = "allow"
+undocumented_unsafe_blocks = "warn"
 unnecessary_wraps = "warn"
 used_underscore_binding = "warn"
 useless_transmute = "warn"
@@ -90,6 +90,16 @@ unused_lifetimes = "warn"
 [lints.rust.rust_2018_idioms]
 level = "warn"
 priority = -1
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(pyo3_disable_reference_pool)",
+    "cfg(pyo3_leak_on_drop_without_reference_pool)",
+    "cfg(pyo3_use_raw_dylib)",
+    'cfg(pyo3_dll, values("python3", "python3_d", "python3t", "python3t_d", "python38", "python38_d", "python39", "python39_d", "python310", "python310_d", "python311", "python311_d", "python312", "python312_d", "python313", "python313_d", "python313t", "python313t_d", "python314", "python314_d", "python314t", "python314t_d", "python315", "python315_d", "python315t", "python315t_d", "python316", "python316_d", "python316t", "python316t_d", "libpypy3.11-c"))',
+]
 
 [lints.rustdoc]
 bare_urls = "warn"

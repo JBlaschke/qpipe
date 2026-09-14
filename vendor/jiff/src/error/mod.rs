@@ -117,7 +117,7 @@ impl Error {
         use self::ErrorKind::*;
         matches!(
             *self.root().kind(),
-            Bounds(_) | SpecialBounds(_) | ITimeRange(_)
+            Bounds(_) | SpecialBounds(_) | JcoreRange(_)
         )
     }
 
@@ -204,30 +204,43 @@ impl Error {
         Error::from(ErrorKind::Bounds(err))
     }
 
+    /// Builds a `jiff::Error` from a `jcore::tz::posix::ParseError`.
+    ///
+    /// This very much cannot be added as a `From` impl because that would
+    /// introduce a public dependency on `jcore`.
+    #[inline(never)]
+    #[cold]
+    pub(crate) fn jcore_posix_parse(
+        err: jcore::tz::posix::ParseError,
+    ) -> Error {
+        Error::from(ErrorKind::JcorePosixParse(err))
+    }
+
+    /// Builds a `jiff::Error` from a `jcore::tz::tzif::ParseError`.
+    ///
+    /// This very much cannot be added as a `From` impl because that would
+    /// introduce a public dependency on `jcore`.
+    #[cfg(feature = "alloc")]
+    #[inline(never)]
+    #[cold]
+    pub(crate) fn jcore_tzif_parse(err: jcore::tz::tzif::ParseError) -> Error {
+        Error::from(ErrorKind::JcoreTzifParse(err))
+    }
+
+    /// Builds a `jiff::Error` from a `jcore::bounds::RangeError`.
+    ///
+    /// This very much cannot be added as a `From` impl because that would
+    /// introduce a public dependency on `jcore`.
+    #[inline(never)]
+    #[cold]
+    pub(crate) fn jcore_range(err: jcore::bounds::RangeError) -> Error {
+        Error::from(ErrorKind::JcoreRange(err))
+    }
+
     #[inline(never)]
     #[cold]
     pub(crate) fn special_bounds(err: SpecialBoundsError) -> Error {
         Error::from(ErrorKind::SpecialBounds(err))
-    }
-
-    /// Creates a new error from the special "shared" error type.
-    pub(crate) fn itime_range(
-        err: crate::shared::util::itime::RangeError,
-    ) -> Error {
-        Error::from(ErrorKind::ITimeRange(err))
-    }
-
-    /// Creates a new error from the special TZif error type.
-    #[cfg(feature = "alloc")]
-    pub(crate) fn tzif(err: crate::shared::tzif::TzifError) -> Error {
-        Error::from(ErrorKind::Tzif(err))
-    }
-
-    /// Creates a new error from the special `PosixTimeZoneError` type.
-    pub(crate) fn posix_tz(
-        err: crate::shared::posix::PosixTimeZoneError,
-    ) -> Error {
-        Error::from(ErrorKind::PosixTz(err))
     }
 
     /// A convenience constructor for building an I/O error.
@@ -394,9 +407,32 @@ impl core::fmt::Debug for Error {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Error {
+    fn format(&self, f: defmt::Formatter) {
+        let Some(ref inner) = self.inner else {
+            return defmt::write!(f, "Error {{ kind: None }}");
+        };
+        #[cfg(feature = "alloc")]
+        {
+            defmt::write!(
+                f,
+                "Error {{ kind: {}, cause: {} }}",
+                inner.kind,
+                inner.cause
+            );
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            defmt::write!(f, "Error {{ kind: {} }}", inner.kind);
+        }
+    }
+}
+
 /// The underlying kind of a [`Error`].
 #[derive(Debug)]
 #[cfg_attr(not(feature = "alloc"), derive(Clone))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum ErrorKind {
     Adhoc(AdhocError),
     Bounds(BoundsError),
@@ -417,11 +453,13 @@ enum ErrorKind {
     FmtStrtimeParse(self::fmt::strtime::ParseError),
     #[allow(dead_code)] // not used in some feature configs
     IO(IOError),
-    ITimeRange(crate::shared::util::itime::RangeError),
+    JcorePosixParse(jcore::tz::posix::ParseError),
+    #[cfg(feature = "alloc")]
+    JcoreTzifParse(jcore::tz::tzif::ParseError),
+    JcoreRange(jcore::bounds::RangeError),
     OsStrUtf8(self::util::OsStrUtf8Error),
     ParseInt(self::util::ParseIntError),
     ParseFraction(self::util::ParseFractionError),
-    PosixTz(crate::shared::posix::PosixTimeZoneError),
     RoundingIncrement(self::util::RoundingIncrementError),
     SignedDuration(self::signed_duration::Error),
     Span(self::span::Error),
@@ -432,13 +470,10 @@ enum ErrorKind {
     TzDb(self::tz::db::Error),
     TzConcatenated(self::tz::concatenated::Error),
     TzOffset(self::tz::offset::Error),
-    TzPosix(self::tz::posix::Error),
     TzSystem(self::tz::system::Error),
     TzTimeZone(self::tz::timezone::Error),
     #[allow(dead_code)]
     TzZic(self::tz::zic::Error),
-    #[cfg(feature = "alloc")]
-    Tzif(crate::shared::tzif::TzifError),
     Unknown,
     Zoned(self::zoned::Error),
 }
@@ -450,6 +485,10 @@ impl core::fmt::Display for ErrorKind {
         match *self {
             Adhoc(ref msg) => msg.fmt(f),
             Bounds(ref msg) => msg.fmt(f),
+            JcorePosixParse(ref msg) => msg.fmt(f),
+            #[cfg(feature = "alloc")]
+            JcoreTzifParse(ref msg) => msg.fmt(f),
+            JcoreRange(ref msg) => msg.fmt(f),
             Civil(ref err) => err.fmt(f),
             CrateFeature(ref err) => err.fmt(f),
             Duration(ref err) => err.fmt(f),
@@ -465,11 +504,9 @@ impl core::fmt::Display for ErrorKind {
             FmtStrtimeParse(ref err) => err.fmt(f),
             FmtTemporal(ref err) => err.fmt(f),
             IO(ref err) => err.fmt(f),
-            ITimeRange(ref err) => err.fmt(f),
             OsStrUtf8(ref err) => err.fmt(f),
             ParseInt(ref err) => err.fmt(f),
             ParseFraction(ref err) => err.fmt(f),
-            PosixTz(ref err) => err.fmt(f),
             RoundingIncrement(ref err) => err.fmt(f),
             SignedDuration(ref err) => err.fmt(f),
             Span(ref err) => err.fmt(f),
@@ -480,12 +517,9 @@ impl core::fmt::Display for ErrorKind {
             TzDb(ref err) => err.fmt(f),
             TzConcatenated(ref err) => err.fmt(f),
             TzOffset(ref err) => err.fmt(f),
-            TzPosix(ref err) => err.fmt(f),
             TzSystem(ref err) => err.fmt(f),
             TzTimeZone(ref err) => err.fmt(f),
             TzZic(ref err) => err.fmt(f),
-            #[cfg(feature = "alloc")]
-            Tzif(ref err) => err.fmt(f),
             Unknown => f.write_str("unknown Jiff error"),
             Zoned(ref err) => err.fmt(f),
         }
@@ -512,6 +546,7 @@ impl From<ErrorKind> for Error {
 /// support the `Error::from_args` public API, which permits users of Jiff to
 /// manifest their own `Error` values from an arbitrary message.
 #[cfg_attr(not(feature = "alloc"), derive(Clone))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct AdhocError {
     #[cfg(feature = "alloc")]
     message: alloc::boxed::Box<str>,
@@ -559,6 +594,7 @@ impl core::fmt::Debug for AdhocError {
 /// This enum doesn't necessarily contain every Jiff crate feature. It only
 /// contains the features whose absence can result in an error.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum CrateFeatureError {
     #[cfg(not(feature = "tz-system"))]
     TzSystem,
@@ -643,6 +679,16 @@ impl core::fmt::Debug for IOError {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for IOError {
+    fn format(&self, f: defmt::Formatter) {
+        // `std::io::Error` does not implement `defmt::Format`. Since this
+        // error is std-only and defmt is mainly used in embedded contexts,
+        // omitting the error is probably fine.
+        defmt::write!(f, "IOError(unavailable)");
+    }
+}
+
 #[cfg(feature = "std")]
 impl From<std::io::Error> for IOError {
     fn from(err: std::io::Error) -> IOError {
@@ -685,6 +731,16 @@ impl core::fmt::Debug for FilePathError {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for FilePathError {
+    fn format(&self, f: defmt::Formatter) {
+        // `std::path::PathBuf` does not implement `defmt::Format`. Since this
+        // error is std-only and defmt is mainly used in embedded contexts,
+        // omitting the path is probably fine.
+        defmt::write!(f, "FilePathError(unavailable)");
+    }
+}
+
 /// A simple trait to encapsulate automatic conversion to `Error`.
 ///
 /// This trait basically exists to make `Error::context` work without needing
@@ -701,6 +757,15 @@ impl IntoError for Error {
     #[inline(always)]
     fn into_error(self) -> Error {
         self
+    }
+}
+
+// This trait impl is okay because `IntoError` is a crate-internal trait. So
+// this impl will not cause a public dependency on `jcore`.
+impl IntoError for jcore::bounds::RangeError {
+    #[inline(always)]
+    fn into_error(self) -> Error {
+        Error::jcore_range(self)
     }
 }
 
@@ -769,37 +834,49 @@ mod tests {
     // general, we should not increase the size without a very good reason.
     #[test]
     fn error_size() {
-        let mut expected_size = core::mem::size_of::<usize>();
-        if !cfg!(feature = "alloc") {
-            // oooowwwwwwwwwwwch.
-            //
-            // Like, this is horrible, right? core-only environments are
-            // precisely the place where one want to keep things slim. But
-            // in core-only, I don't know of a way to introduce any sort of
-            // indirection in the library level without using a completely
-            // different API.
-            //
-            // This is what makes me doubt that core-only Jiff is actually
-            // useful. In what context are people using a huge library like
-            // Jiff but can't define a small little heap allocator?
-            //
-            // OK, this used to be `expected_size *= 10`, but I slimmed it down
-            // to x3. Still kinda sucks right? If we tried harder, I think we
-            // could probably slim this down more. And if we were willing to
-            // sacrifice error message quality even more (like, all the way),
-            // then we could make `Error` a zero sized type. Which might
-            // actually be the right trade-off for core-only, but I'll hold off
-            // until we have some real world use cases.
-            //
-            // OK... after switching to structured errors, this jumped
-            // back up to `expected_size *= 6`. And that was with me being
-            // conscientious about what data we store inside of error types.
-            // Blech.
-            //
-            // 2026-01-14: A change to the `Offset` type made this move back
-            // down to `expected_size *= 4`.
-            expected_size *= 4;
+        if cfg!(feature = "alloc") {
+            let expected_size = core::mem::size_of::<usize>();
+            assert_eq!(expected_size, core::mem::size_of::<Error>());
+            return;
         }
-        assert_eq!(expected_size, core::mem::size_of::<Error>());
+        // oooowwwwwwwwwwwch.
+        //
+        // Like, this is horrible, right? core-only environments are
+        // precisely the place where one want to keep things slim. But
+        // in core-only, I don't know of a way to introduce any sort of
+        // indirection in the library level without using a completely
+        // different API.
+        //
+        // This is what makes me doubt that core-only Jiff is actually
+        // useful. In what context are people using a huge library like
+        // Jiff but can't define a small little heap allocator?
+        //
+        // OK, this used to be `expected_size *= 10`, but I slimmed it down
+        // to x3. Still kinda sucks right? If we tried harder, I think we
+        // could probably slim this down more. And if we were willing to
+        // sacrifice error message quality even more (like, all the way),
+        // then we could make `Error` a zero sized type. Which might
+        // actually be the right trade-off for core-only, but I'll hold off
+        // until we have some real world use cases.
+        //
+        // OK... after switching to structured errors, this jumped
+        // back up to `expected_size *= 6`. And that was with me being
+        // conscientious about what data we store inside of error types.
+        // Blech.
+        //
+        // 2026-01-14: A change to the `Offset` type made this move back
+        // down to `expected_size *= 4`.
+        //
+        // 2026-05-28: No changes here, but `4 * pointer-size` is not the
+        // right calculation here. This is unfortunately coupled with an
+        // internal representation for the biggest possible error variant.
+        // And also compiler optimizations. But at time of writing, it's
+        // from the `jiff::error::tz::offset::Error` enum. We get 4 32-bit
+        // integers (always 32-bit) plus one pointer sized discriminant.
+        //
+        // 2026-05-28 redux: this now seems coupled with compiler
+        // optimizations. So just give up and check that it's reasonable.
+        let got = core::mem::size_of::<Error>();
+        assert!(got <= 40, "wanted error size to be <= 40, but got {got}");
     }
 }

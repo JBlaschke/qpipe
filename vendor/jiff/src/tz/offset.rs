@@ -3,19 +3,20 @@ use core::{
     time::Duration as UnsignedDuration,
 };
 
+use jcore::{constants as c, tz::Offset as JOffset};
+
 use crate::{
     civil,
     duration::{Duration, SDuration},
     error::{tz::offset::Error as E, Error, ErrorContext},
-    shared::util::itime::IOffset,
     span::Span,
     timestamp::Timestamp,
     tz::{AmbiguousOffset, AmbiguousTimestamp, AmbiguousZoned, TimeZone},
-    util::{array_str::ArrayStr, b, constant, round::Increment},
+    util::{b, constant, round::Increment},
     RoundMode, SignedDuration, Unit,
 };
 
-/// An enum indicating whether a particular datetime  is in DST or not.
+/// An enum indicating whether a particular datetime is in DST or not.
 ///
 /// DST stands for "daylight saving time." It is a label used to apply to
 /// points in time as a way to contrast it with "standard time." DST is
@@ -33,6 +34,7 @@ use crate::{
 /// This type has a `From<bool>` trait implementation, where the bool is
 /// interpreted as being `true` when DST is active.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Dst {
     /// DST is not in effect. In other words, standard time is in effect.
     No,
@@ -52,6 +54,13 @@ impl Dst {
     /// offset from UTC used when DST is not in effect.
     pub fn is_std(self) -> bool {
         matches!(self, Dst::No)
+    }
+
+    pub(crate) fn from_jcore(dst: jcore::tz::Dst) -> Dst {
+        match dst {
+            jcore::tz::Dst::Yes => Dst::Yes,
+            jcore::tz::Dst::No => Dst::No,
+        }
     }
 }
 
@@ -120,20 +129,21 @@ impl From<bool> for Dst {
 /// since there is no time zone identifier, the offset instead is repeated as
 /// an additional assertion that a fixed offset datetime was intended.
 #[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Offset {
-    span: i32,
+    inner: JOffset,
 }
 
 impl Offset {
     /// The minimum possible time zone offset.
     ///
     /// This corresponds to the offset `-25:59:59`.
-    pub const MIN: Offset = Offset { span: b::OffsetTotalSeconds::MIN };
+    pub const MIN: Offset = Offset { inner: JOffset::MIN };
 
     /// The maximum possible time zone offset.
     ///
     /// This corresponds to the offset `25:59:59`.
-    pub const MAX: Offset = Offset { span: b::OffsetTotalSeconds::MAX };
+    pub const MAX: Offset = Offset { inner: JOffset::MAX };
 
     /// The offset corresponding to UTC. That is, no offset at all.
     ///
@@ -142,7 +152,7 @@ impl Offset {
     /// specifically, while `Offset::ZERO` ought to be used when one wants to
     /// express "no offset." For example, when adding offsets, `Offset::ZERO`
     /// corresponds to the identity.
-    pub const UTC: Offset = Offset::ZERO;
+    pub const UTC: Offset = Offset { inner: JOffset::UTC };
 
     /// The offset corresponding to no offset at all.
     ///
@@ -151,7 +161,7 @@ impl Offset {
     /// desired specifically, while `Offset::UTC` ought to be used when one
     /// wants to express UTC. For example, when adding offsets, `Offset::ZERO`
     /// corresponds to the identity.
-    pub const ZERO: Offset = Offset::constant(0);
+    pub const ZERO: Offset = Offset { inner: JOffset::UTC };
 
     /// Creates a new time zone offset in a `const` context from a given number
     /// of hours.
@@ -230,11 +240,11 @@ impl Offset {
     // exported instead of this monstrosity.
     #[inline]
     pub(crate) const fn constant_seconds(seconds: i32) -> Offset {
-        let span = constant::unwrapr!(
-            b::OffsetTotalSeconds::checkc(seconds as i64),
+        let inner = constant::unwrapr!(
+            JOffset::from_seconds(seconds),
             "invalid time zone offset seconds",
         );
-        Offset { span }
+        Offset { inner }
     }
 
     /// Creates a new time zone offset from a given number of hours.
@@ -262,7 +272,8 @@ impl Offset {
     /// ```
     #[inline]
     pub fn from_hours(hours: i8) -> Result<Offset, Error> {
-        Offset::from_seconds(i32::from(hours) * b::SECS_PER_HOUR_32)
+        let inner = JOffset::from_hours(hours).map_err(Error::jcore_range)?;
+        Ok(Offset { inner })
     }
 
     /// Creates a new time zone offset in a `const` context from a given number
@@ -292,8 +303,9 @@ impl Offset {
     /// ```
     #[inline]
     pub fn from_seconds(seconds: i32) -> Result<Offset, Error> {
-        let span = b::OffsetTotalSeconds::check(seconds)?;
-        Ok(Offset::from_seconds_unchecked(span))
+        let inner =
+            JOffset::from_seconds(seconds).map_err(Error::jcore_range)?;
+        Ok(Offset { inner })
     }
 
     /// Returns the total number of seconds in this offset.
@@ -318,7 +330,7 @@ impl Offset {
     /// ```
     #[inline]
     pub const fn seconds(self) -> i32 {
-        self.span
+        self.inner.seconds()
     }
 
     /// Returns the negation of this offset.
@@ -338,7 +350,8 @@ impl Offset {
     /// assert_eq!(-tz::offset(-5), tz::offset(5));
     /// ```
     pub fn negate(self) -> Offset {
-        Offset { span: -self.span }
+        let inner = self.inner.negate();
+        Offset { inner }
     }
 
     /// Returns the "sign number" or "signum" of this offset.
@@ -357,7 +370,7 @@ impl Offset {
     /// ```
     #[inline]
     pub fn signum(self) -> i8 {
-        b::Sign::from(self.seconds()).as_i8()
+        self.inner.signum()
     }
 
     /// Returns true if and only if this offset is positive.
@@ -374,7 +387,7 @@ impl Offset {
     /// assert!(!tz::offset(-5).is_positive());
     /// ```
     pub fn is_positive(self) -> bool {
-        self.seconds() > 0
+        self.inner.is_positive()
     }
 
     /// Returns true if and only if this offset is less than zero.
@@ -389,7 +402,7 @@ impl Offset {
     /// assert!(tz::offset(-5).is_negative());
     /// ```
     pub fn is_negative(self) -> bool {
-        self.seconds() < 0
+        self.inner.is_negative()
     }
 
     /// Returns true if and only if this offset is zero.
@@ -406,7 +419,7 @@ impl Offset {
     /// assert!(!tz::offset(-5).is_zero());
     /// ```
     pub fn is_zero(self) -> bool {
-        self.seconds() == 0
+        self.inner.is_zero()
     }
 
     /// Converts this offset into a [`TimeZone`].
@@ -443,10 +456,8 @@ impl Offset {
     /// ```
     #[inline]
     pub fn to_datetime(self, timestamp: Timestamp) -> civil::DateTime {
-        civil::DateTime::from_idatetime_const(
-            timestamp
-                .to_itimestamp_const()
-                .to_datetime(IOffset { second: self.seconds() }),
+        civil::DateTime::from_jcore(
+            self.inner.to_datetime(timestamp.to_jcore()),
         )
     }
 
@@ -509,10 +520,11 @@ impl Offset {
         self,
         dt: civil::DateTime,
     ) -> Result<Timestamp, Error> {
-        let its =
-            dt.to_idatetime_const().to_timestamp(self.to_ioffset_const());
-        Timestamp::new(its.second, its.nanosecond)
-            .context(E::ConvertDateTimeToTimestamp { offset: self })
+        Ok(Timestamp::from_jcore(
+            self.inner
+                .to_timestamp(dt.to_jcore())
+                .context(E::ConvertDateTimeToTimestamp { offset: self })?,
+        ))
     }
 
     /// Adds the given span of time to this offset.
@@ -1000,52 +1012,60 @@ impl Offset {
             b::OffsetSeconds::checkc(seconds as i64),
             "invalid time zone offset seconds",
         );
-        let span = (hours as i32 * b::SECS_PER_HOUR_32)
-            + (minutes as i32 * b::SECS_PER_MIN_32)
+        let seconds = (hours as i32 * c::SECS_PER_HOUR_32)
+            + (minutes as i32 * c::SECS_PER_MIN_32)
             + (seconds as i32);
-        Offset { span }
+        let inner =
+            constant::unwrapr!(JOffset::from_seconds(seconds), "valid offset");
+        Offset { inner }
     }
 
     #[inline]
     pub(crate) fn part_hours(self) -> i8 {
-        (self.seconds() / b::SECS_PER_HOUR_32) as i8
+        (self.seconds() / c::SECS_PER_HOUR_32) as i8
     }
 
     #[inline]
     pub(crate) fn part_minutes(self) -> i8 {
-        ((self.seconds() / b::SECS_PER_MIN_32) % b::MINS_PER_HOUR_32) as i8
+        ((self.seconds() / c::SECS_PER_MIN_32) % c::MINS_PER_HOUR_32) as i8
     }
 
     #[inline]
     pub(crate) fn part_seconds(self) -> i8 {
-        (self.seconds() % b::SECS_PER_MIN_32) as i8
+        (self.seconds() % c::SECS_PER_MIN_32) as i8
     }
 
     #[inline]
-    const fn to_ioffset_const(self) -> IOffset {
-        IOffset { second: self.span }
+    pub(crate) const fn from_jcore(offset: JOffset) -> Offset {
+        Offset { inner: offset }
     }
 
     #[inline]
-    pub(crate) const fn from_ioffset_const(ioff: IOffset) -> Offset {
-        Offset::from_seconds_unchecked(ioff.second)
+    pub(crate) const fn from_seconds_unchecked(seconds: i32) -> Offset {
+        // TODO: Benchmark whether the check here is hurting us. If it is,
+        // then we'll need a safety boundary in jiff-core to support this
+        // operation.
+        let inner =
+            constant::unwrapr!(JOffset::from_seconds(seconds), "valid offset");
+        Offset { inner }
     }
 
     #[inline]
-    pub(crate) const fn from_seconds_unchecked(second: i32) -> Offset {
-        Offset { span: second }
-    }
-
-    #[inline]
-    pub(crate) fn to_array_str(&self) -> ArrayStr<9> {
+    pub(crate) fn to_abbreviation(&self) -> jcore::tz::Abbreviation {
         use core::fmt::Write;
 
-        let mut dst = ArrayStr::new("").unwrap();
+        let mut dst = jcore::util::ArrayStr::<9>::new("").unwrap();
         // OK because the string representation of an offset
         // can never exceed 9 bytes. The longest possible, e.g.,
         // is `-25:59:59`.
         write!(&mut dst, "{}", self).unwrap();
-        dst
+        // The correctness argument here is unfortunately convuleted. In
+        // environments with `alloc`, this will always succeed because the
+        // heap is used as a fallback. But in core-only environments, the
+        // abbreviation capacity is specifically set to `9` in jiff-core to
+        // accommodate this use case. Thus, this can never fail.
+        jcore::tz::Abbreviation::new(dst.as_str())
+            .expect("`Abbreviation` capacity is big enough")
     }
 
     /// Round this offset to the nearest minute and returns the hour/minute
@@ -1347,6 +1367,21 @@ impl TryFrom<SignedDuration> for Offset {
             i32::try_from(seconds).map_err(|_| E::OverflowSignedDuration)?;
         Offset::from_seconds(seconds)
             .map_err(|_| Error::from(E::OverflowSignedDuration))
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Offset {
+    fn format(&self, f: defmt::Formatter) {
+        let sign = if self.is_negative() { "-" } else { "" };
+        defmt::write!(
+            f,
+            "{=str}{=u8:02}:{=u8:02}:{=u8:02}",
+            sign,
+            self.part_hours().unsigned_abs(),
+            self.part_minutes().unsigned_abs(),
+            self.part_seconds().unsigned_abs(),
+        )
     }
 }
 

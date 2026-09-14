@@ -156,14 +156,21 @@ impl<'data> BorrowedBuffer<'data> {
         buf: &'data mut alloc::vec::Vec<u8>,
         mut with: impl FnMut(&mut BorrowedBuffer<'_>) -> T,
     ) -> T {
+        let old_len = buf.len();
         let mut bbuf = BorrowedBuffer::from_vec_spare_capacity(buf);
         let returned = with(&mut bbuf);
         let new_len = bbuf.len();
-        // SAFETY: `BorrowedBuffer::len()` always reflects the number of
-        // bytes that have been written to. Thus, the data up to the given new
-        // length is guaranteed to be initialized.
+        // SAFETY: `new_len` always reflects the number of bytes that have been
+        // written to. Moreover, the buffer provided may not be empty, in which
+        // case `old_len` reflects the number of bytes already there. Thus, the
+        // data up to the given new length is guaranteed to be initialized.
+        //
+        // Note that the addition here is guaranteed not to overflow (and
+        // thus potentially wrap in release mode) since it reflects the total
+        // capacity of `buf`. If it overflowed, then it would imply that the
+        // capacity for `buf` was invalid.
         unsafe {
-            buf.set_len(new_len);
+            buf.set_len(old_len + new_len);
         }
         returned
     }
@@ -518,6 +525,9 @@ impl<'data> BorrowedBuffer<'data> {
         assert!(n <= 999_999_999);
         let mut buf = ArrayBuffer::<MAX_PRECISION>::default();
         for i in (0..MAX_PRECISION).rev() {
+            // SAFETY: Okay since `i` is guaranteed to be a valid index in
+            // `buf`. Namely, `buf` is created with `MAX_PRECISION` slots and
+            // `MAX_PRECISION - 1` is the largest value of `i` possible here.
             unsafe {
                 buf.data.get_unchecked_mut(i).write(b'0' + ((n % 10) as u8));
             }
@@ -715,7 +725,13 @@ impl<'buffer, 'data, 'write> BorrowedWriter<'buffer, 'data, 'write> {
         bbuf: &'buffer mut BorrowedBuffer<'data>,
         wtr: &'write mut dyn Write,
     ) -> BorrowedWriter<'buffer, 'data, 'write> {
-        assert!(bbuf.capacity() >= BROAD_MINIMUM_BUFFER_LEN);
+        assert!(
+            bbuf.capacity() >= BROAD_MINIMUM_BUFFER_LEN,
+            "capacity ({capacity}) must be \
+             at least {BROAD_MINIMUM_BUFFER_LEN} \
+             to handle integer formatting",
+            capacity = bbuf.capacity(),
+        );
         BorrowedWriter { bbuf, wtr }
     }
 
@@ -771,6 +787,28 @@ impl<'buffer, 'data, 'write> BorrowedWriter<'buffer, 'data, 'write> {
             self.flush()?;
         }
         self.bbuf.write_ascii_char(byte);
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "perf-inline", inline(always))]
+    pub(crate) fn write_int(
+        &mut self,
+        n: impl Into<u64>,
+    ) -> Result<(), Error> {
+        let n = n.into();
+        self.if_will_fill_then_flush(digits(n))?;
+        self.bbuf.write_int(n);
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "perf-inline", inline(always))]
+    pub(crate) fn write_int1(
+        &mut self,
+        n: impl Into<u64>,
+    ) -> Result<(), Error> {
+        let n = n.into();
+        self.if_will_fill_then_flush(1usize)?;
+        self.bbuf.write_int1(n);
         Ok(())
     }
 
@@ -1349,5 +1387,43 @@ mod tests {
         let mut buf = ArrayBuffer::<100>::default();
         let mut bbuf = buf.as_borrowed();
         bbuf.write_fraction(None, 1_000_000_000);
+    }
+
+    /// This tests that writing into an empty buffer is okay.
+    ///
+    /// This always worked, but we test it along with a non-empty buffer below
+    /// for completeness.
+    ///
+    /// Ref: https://github.com/BurntSushi/jiff/issues/592
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn spare_capacity_empty_buffer() {
+        use crate::{civil::date, fmt::temporal::DateTimePrinter};
+
+        let mut s = alloc::string::String::new();
+        let printer = DateTimePrinter::new();
+        let d = date(2024, 6, 15);
+        printer.print_date(&d, &mut s).unwrap();
+        assert_eq!(s.chars().count(), 10);
+    }
+
+    /// This tests that writing into a non-empty buffer is okay.
+    ///
+    /// Previously, this would result in a truncation of the buffer that,
+    /// when provided via a `String`, could result in the `String` containing
+    /// invalid UTF-8. (And just generally incorrect results even if the string
+    /// contained valid UTF-8.)
+    ///
+    /// Ref: https://github.com/BurntSushi/jiff/issues/592
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn spare_capacity_non_empty_buffer() {
+        use crate::{civil::date, fmt::temporal::DateTimePrinter};
+
+        let mut s = alloc::string::String::from("🎉🎉🎉");
+        let printer = DateTimePrinter::new();
+        let d = date(2024, 6, 15);
+        printer.print_date(&d, &mut s).unwrap();
+        assert_eq!(s.chars().map(|c| c.len_utf8()).sum::<usize>(), 22);
     }
 }

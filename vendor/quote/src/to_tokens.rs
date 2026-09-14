@@ -7,6 +7,7 @@ use alloc::string::String;
 use core::ffi::CStr;
 use core::iter;
 use proc_macro2::{Group, Ident, Literal, Punct, Span, TokenStream, TokenTree};
+use std::sync::Arc;
 
 /// Types that can be interpolated inside a `quote!` invocation.
 pub trait ToTokens {
@@ -99,6 +100,12 @@ impl<T: ?Sized + ToTokens> ToTokens for Box<T> {
 }
 
 impl<T: ?Sized + ToTokens> ToTokens for Rc<T> {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        (**self).to_tokens(tokens);
+    }
+}
+
+impl<T: ?Sized + ToTokens> ToTokens for Arc<T> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         (**self).to_tokens(tokens);
     }

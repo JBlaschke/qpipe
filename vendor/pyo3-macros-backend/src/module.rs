@@ -18,7 +18,7 @@ use crate::{
     utils::{has_attribute, has_attribute_with_namespace, Ctx, IdentOrStr, PythonDoc},
 };
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{quote, ToTokens};
 use std::ffi::CString;
 use syn::LitCStr;
 use syn::{
@@ -116,7 +116,7 @@ pub fn pymodule_module_impl(
     options.take_pyo3_options(attrs)?;
     let ctx = &Ctx::new(&options.krate, None);
     let Ctx { pyo3_path, .. } = ctx;
-    let doc = get_doc(attrs, None, ctx)?;
+    let doc = get_doc(attrs, None);
     let name = options
         .name
         .map_or_else(|| ident.unraw(), |name| name.value.0);
@@ -319,6 +319,7 @@ pub fn pymodule_module_impl(
                         item.ident.unraw().to_string(),
                         PyExpr::constant_from_expression(&item.expr),
                         (*item.ty).clone(),
+                        get_doc(&item.attrs, None).as_ref(),
                         true,
                     );
                     introspection_chunks.push(quote! {
@@ -380,6 +381,7 @@ pub fn pymodule_module_impl(
         &name.to_string(),
         &module_items,
         &module_items_cfg_attrs,
+        doc.as_ref(),
         pymodule_init.is_some(),
     );
     #[cfg(not(feature = "experimental-inspect"))]
@@ -398,8 +400,8 @@ pub fn pymodule_module_impl(
         quote! { __pyo3_pymodule },
         options.submodule.is_some(),
         gil_used,
-        doc,
-    );
+        doc.as_ref(),
+    )?;
 
     let module_consts_names = module_consts.iter().map(|i| i.unraw().to_string());
 
@@ -447,7 +449,7 @@ pub fn pymodule_function_impl(
         .name
         .map_or_else(|| ident.unraw(), |name| name.value.0);
     let vis = &function.vis;
-    let doc = get_doc(&function.attrs, None, ctx)?;
+    let doc = get_doc(&function.attrs, None);
 
     let gil_used = options.gil_used.is_some_and(|op| op.value.value);
 
@@ -458,12 +460,18 @@ pub fn pymodule_function_impl(
         quote! { ModuleExec::__pyo3_module_exec },
         false,
         gil_used,
-        doc,
-    );
+        doc.as_ref(),
+    )?;
 
     #[cfg(feature = "experimental-inspect")]
-    let introspection =
-        module_introspection_code(pyo3_path, &name.unraw().to_string(), &[], &[], true);
+    let introspection = module_introspection_code(
+        pyo3_path,
+        &name.unraw().to_string(),
+        &[],
+        &[],
+        doc.as_ref(),
+        true,
+    );
     #[cfg(not(feature = "experimental-inspect"))]
     let introspection = quote! {};
     #[cfg(feature = "experimental-inspect")]
@@ -476,8 +484,7 @@ pub fn pymodule_function_impl(
     if function.sig.inputs.len() == 2 {
         module_args.push(quote!(module.py()));
     }
-    module_args
-        .push(quote!(::std::convert::Into::into(#pyo3_path::impl_::pymethods::BoundRef(module))));
+    module_args.push(quote!(::std::convert::Into::into(module)));
 
     Ok(quote! {
         #[doc(hidden)]
@@ -507,15 +514,21 @@ fn module_initialization(
     module_exec: TokenStream,
     is_submodule: bool,
     gil_used: bool,
-    doc: PythonDoc,
-) -> TokenStream {
+    doc: Option<&PythonDoc>,
+) -> Result<TokenStream> {
     let Ctx { pyo3_path, .. } = ctx;
     let pyinit_symbol = format!("PyInit_{name}");
+    let pymodexport_symbol = format!("PyModExport_{name}");
     let pyo3_name = LitCStr::new(&CString::new(full_name).unwrap(), Span::call_site());
+    let doc = if let Some(doc) = doc {
+        doc.to_cstr_stream(ctx)?
+    } else {
+        c"".into_token_stream()
+    };
 
     let mut result = quote! {
         #[doc(hidden)]
-        pub const __PYO3_NAME: &'static ::std::ffi::CStr = #pyo3_name;
+        pub static __PYO3_NAME: &'static ::std::ffi::CStr = #pyo3_name;
 
         // This structure exists for `fn` modules declared within `fn` bodies, where due to the hidden
         // module (used for importing) the `fn` to initialize the module cannot be seen from the #module_def
@@ -527,30 +540,39 @@ fn module_initialization(
         pub static _PYO3_DEF: #pyo3_path::impl_::pymodule::ModuleDef = {
             use #pyo3_path::impl_::pymodule as impl_;
 
-            unsafe extern "C" fn __pyo3_module_exec(module: *mut #pyo3_path::ffi::PyObject) -> ::std::os::raw::c_int {
+            unsafe extern "C" fn __pyo3_module_exec(module: *mut #pyo3_path::ffi::PyObject) -> ::std::ffi::c_int {
                 #pyo3_path::impl_::trampoline::module_exec(module, #module_exec)
             }
 
-            static SLOTS: impl_::PyModuleSlots<4> = impl_::PyModuleSlotsBuilder::new()
+            static DOC: &'static ::std::ffi::CStr = #doc;
+            static SLOTS: impl_::PrimaryModuleSlots = impl_::PyModuleSlotsBuilder::new()
                 .with_mod_exec(__pyo3_module_exec)
+                .with_abi_info()
                 .with_gil_used(#gil_used)
+                .with_name(__PYO3_NAME)
+                .with_doc(DOC)
                 .build();
+            static SECONDARY_SLOTS: impl_::SecondaryModuleSlots = impl_::secondary_slots(&SLOTS);
 
-            impl_::ModuleDef::new(__PYO3_NAME, #doc, &SLOTS)
+            // Since the macros need to be written agnostic to the Python version
+            // we need to explicitly pass the name and docstring for PyModuleDef
+            // initialization.
+            impl_::ModuleDef::new(__PYO3_NAME, DOC, &SLOTS, &SECONDARY_SLOTS)
         };
     };
     if !is_submodule {
         result.extend(quote! {
-            /// This autogenerated function is called by the python interpreter when importing
-            /// the module.
-            #[doc(hidden)]
-            #[export_name = #pyinit_symbol]
-            pub unsafe extern "C" fn __pyo3_init() -> *mut #pyo3_path::ffi::PyObject {
-                _PYO3_DEF.init_multi_phase()
-            }
+            // We want to define only one or the other of these initialization functions
+            // so we implement them in macros to allow the version gating to live there
+
+            // Defines the `PyInit_<name>` entry point used by Python 3.14 and older.
+            #pyo3_path::__pyo3_pyinit!(#pyinit_symbol, _PYO3_DEF);
+
+            // Defines the `PyModExport_<name>` entry point used by Python 3.15 and newer.
+            #pyo3_path::__pyo3_pymodexport!(#pymodexport_symbol, _PYO3_DEF);
         });
     }
-    result
+    Ok(result)
 }
 
 /// Finds and takes care of the #[pyfn(...)] in `#[pymodule]`

@@ -1,4 +1,7 @@
-use std::cell::UnsafeCell;
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
+
+use core::cell::UnsafeCell;
 
 use crate::{
     ffi,
@@ -39,8 +42,20 @@ impl PyFunctionDef {
 
 /// Trait to enable the use of `wrap_pyfunction` with both `Python` and `PyModule`,
 /// and also to infer the return type of either `&'py PyCFunction` or `Bound<'py, PyCFunction>`.
-pub trait WrapPyFunctionArg<'py, T> {
+pub trait WrapPyFunctionArg<'py, T>: wrap_pyfunctionarg::Sealed {
     fn wrap_pyfunction(self, function_def: &'static PyFunctionDef) -> PyResult<T>;
+}
+
+/// Seals `WrapPyFunctionArg` so that types outside PyO3 cannot implement it.
+mod wrap_pyfunctionarg {
+    use crate::{types::PyModule, Borrowed, Bound, Python};
+
+    pub trait Sealed {}
+    impl<'py> Sealed for Bound<'py, PyModule> {}
+    impl<'py> Sealed for &Bound<'py, PyModule> {}
+    impl<'a, 'py> Sealed for Borrowed<'a, 'py, PyModule> {}
+    impl<'a, 'py> Sealed for &Borrowed<'a, 'py, PyModule> {}
+    impl<'py> Sealed for Python<'py> {}
 }
 
 impl<'py> WrapPyFunctionArg<'py, Bound<'py, PyCFunction>> for Bound<'py, PyModule> {
@@ -103,12 +118,12 @@ pub unsafe fn create_py_c_function<'py>(
         let mod_ptr = m.as_ptr();
         (mod_ptr, Some(m.name()?))
     } else {
-        (std::ptr::null_mut(), None)
+        (core::ptr::null_mut(), None)
     };
 
     let module_name_ptr = module_name
         .as_ref()
-        .map_or(std::ptr::null_mut(), Bound::as_ptr);
+        .map_or(core::ptr::null_mut(), Bound::as_ptr);
 
     unsafe {
         ffi::PyCFunction_NewEx(method_def, mod_ptr, module_name_ptr)

@@ -1,3 +1,5 @@
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
 #![cfg(feature = "smallvec")]
 
 //!  Conversions to and from [smallvec](https://docs.rs/smallvec/).
@@ -18,9 +20,9 @@
 use crate::conversion::{FromPyObjectOwned, IntoPyObject};
 use crate::exceptions::PyTypeError;
 #[cfg(feature = "experimental-inspect")]
-use crate::inspect::types::TypeInfo;
-#[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
+#[cfg(feature = "experimental-inspect")]
+use crate::type_hint_subscript;
 use crate::types::any::PyAnyMethods;
 use crate::types::{PySequence, PyString};
 use crate::{
@@ -48,11 +50,6 @@ where
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         <A::Item>::owned_sequence_into_pyobject(self, py, crate::conversion::private::Token)
     }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::list_of(A::Item::type_output())
-    }
 }
 
 impl<'a, 'py, A> IntoPyObject<'py> for &'a SmallVec<A>
@@ -64,14 +61,12 @@ where
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
+    #[cfg(feature = "experimental-inspect")]
+    const OUTPUT_TYPE: PyStaticExpr = <&[A::Item]>::OUTPUT_TYPE;
+
     #[inline]
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         self.as_slice().into_pyobject(py)
-    }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::list_of(<&A::Item>::type_output())
     }
 }
 
@@ -82,16 +77,15 @@ where
 {
     type Error = PyErr;
 
+    #[cfg(feature = "experimental-inspect")]
+    const INPUT_TYPE: PyStaticExpr =
+        type_hint_subscript!(PySequence::TYPE_HINT, A::Item::INPUT_TYPE);
+
     fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
         if obj.is_instance_of::<PyString>() {
             return Err(PyTypeError::new_err("Can't extract `str` to `SmallVec`"));
         }
         extract_sequence(obj)
-    }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_input() -> TypeInfo {
-        TypeInfo::sequence_of(A::Item::type_input())
     }
 }
 
@@ -102,16 +96,12 @@ where
 {
     // Types that pass `PySequence_Check` usually implement enough of the sequence protocol
     // to support this function and if not, we will only fail extraction safely.
-    let seq = unsafe {
-        if ffi::PySequence_Check(obj.as_ptr()) != 0 {
-            obj.cast_unchecked::<PySequence>()
-        } else {
-            return Err(CastError::new(obj, PySequence::type_object(obj.py()).into_any()).into());
-        }
-    };
+    if unsafe { ffi::PySequence_Check(obj.as_ptr()) } == 0 {
+        return Err(CastError::new(obj, PySequence::type_object(obj.py()).into_any()).into());
+    }
 
-    let mut sv = SmallVec::with_capacity(seq.len().unwrap_or(0));
-    for item in seq.try_iter()? {
+    let mut sv = SmallVec::with_capacity(obj.len().unwrap_or(0));
+    for item in obj.try_iter()? {
         sv.push(item?.extract::<A::Item>().map_err(Into::into)?);
     }
     Ok(sv)

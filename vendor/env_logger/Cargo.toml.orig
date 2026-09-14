@@ -97,7 +97,7 @@ lto = true
 
 [package]
 name = "env_logger"
-version = "0.11.9"
+version = "0.11.11"
 description = """
 A logging implementation for `log` which is configured via an environment
 variable.
@@ -134,11 +134,11 @@ kv = ["log/kv"]
 unstable-kv = ["kv"]
 
 [dependencies]
-log = { version = "0.4.21", features = ["std"] }
-env_filter = { version = "1.0.0", path = "crates/env_filter", default-features = false }
-jiff = { version = "0.2.3", default-features = false, features = ["std"], optional = true }
-anstream = { version = "0.6.11", default-features = false, features = ["wincon"], optional = true }
-anstyle = { version = "1.0.6", optional = true }
+log = { version = "0.4.29", features = ["std"] }
+env_filter = { version = "2.0.0", path = "crates/env_filter", default-features = false, features = ["std"] }
+jiff = { version = "0.2.22", default-features = false, features = ["std"], optional = true }
+anstream = { version = "1.0.0", default-features = false, features = ["wincon"], optional = true }
+anstyle = { version = "1.0.13", optional = true }
 
 [[test]]
 name = "regexp_filter"

@@ -1,8 +1,8 @@
-use std::{
-    ffi::CStr,
-    marker::PhantomData,
-    thread::{self, ThreadId},
-};
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
+
+use core::{ffi::CStr, marker::PhantomData};
+use std::thread::{self, ThreadId};
 
 #[cfg(Py_3_14)]
 use crate::err::error_on_minusone;
@@ -207,7 +207,7 @@ impl LazyTypeObjectInner {
                 unsafe {
                     (*type_object.as_type_ptr()).tp_flags.fetch_or(
                         ffi::Py_TPFLAGS_IMMUTABLETYPE,
-                        std::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
                     )
                 };
                 unsafe { ffi::PyType_Modified(type_object.as_type_ptr()) };
@@ -244,7 +244,7 @@ fn initialize_tp_dict(
     // the POV of other threads.
     for (key, val) in items {
         crate::err::error_on_minusone(py, unsafe {
-            ffi::PyObject_SetAttrString(type_object, key.as_ptr(), val.into_ptr())
+            ffi::PyObject_SetAttrString(type_object, key.as_ptr(), val.as_ptr())
         })?;
     }
     Ok(())

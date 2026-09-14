@@ -187,7 +187,12 @@ extern "C" {
 
     // FIXME(reorg): In recent POSIX versions, this is a signal.h function and not required
     // in pthread.
-    #[cfg(any(target_os = "android", target_os = "l4re", target_os = "linux"))]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "emscripten",
+        target_os = "l4re",
+        target_os = "linux"
+    ))]
     pub fn pthread_kill(thread: crate::pthread_t, sig: c_int) -> c_int;
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -195,7 +200,7 @@ extern "C" {
 
     #[cfg(any(target_os = "android", target_os = "l4re", target_os = "linux"))]
     #[cfg_attr(gnu_time_bits64, link_name = "__pthread_mutex_timedlock64")]
-    #[cfg_attr(musl32_time64, link_name = "__pthread_mutex_timedlock_time64")]
+    #[cfg_attr(musl_redir_time64, link_name = "__pthread_mutex_timedlock_time64")]
     pub fn pthread_mutex_timedlock(
         lock: *mut crate::pthread_mutex_t,
         abstime: *const crate::timespec,
@@ -298,7 +303,12 @@ extern "C" {
 
     // FIXME(reorg): In recent POSIX versions, this is a signal.h function and not required
     // in pthread.
-    #[cfg(any(target_os = "android", target_os = "l4re", target_os = "linux"))]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "emscripten",
+        target_os = "l4re",
+        target_os = "linux"
+    ))]
     pub fn pthread_sigmask(
         how: c_int,
         set: *const crate::sigset_t,

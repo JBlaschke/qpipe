@@ -1,5 +1,9 @@
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use crate::exceptions::PyAttributeError;
 use crate::impl_::pymethods::{Deleter, PyDeleterDef};
+use crate::platform::HashMap;
 #[cfg(not(Py_3_10))]
 use crate::types::typeobject::PyTypeMethods;
 use crate::{
@@ -11,19 +15,22 @@ use crate::{
             assign_sequence_item_from_mapping, get_sequence_item_from_mapping, tp_dealloc,
             tp_dealloc_with_gc, PyClassImpl, PyClassItemsIter, PyObjectOffset,
         },
-        pymethods::{Getter, PyGetterDef, PyMethodDefType, PySetterDef, Setter, _call_clear},
+        pymethods::{
+            synthesized_clear, synthesized_traverse, Getter, PyGetterDef, PyMethodDefType,
+            PySetterDef, Setter,
+        },
         trampoline::trampoline,
     },
     pycell::impl_::PyClassObjectLayout,
     types::PyType,
     Py, PyClass, PyResult, PyTypeInfo, Python,
 };
-use std::{
-    collections::HashMap,
-    ffi::{CStr, CString},
-    os::raw::{c_char, c_int, c_ulong, c_void},
+use core::{
+    ffi::CStr,
+    ffi::{c_char, c_int, c_ulong, c_void},
     ptr::{self, NonNull},
 };
+use std::ffi::CString;
 
 pub(crate) struct PyClassTypeObject {
     pub type_object: Py<PyType>,
@@ -46,6 +53,8 @@ where
         base: *mut ffi::PyTypeObject,
         dealloc: unsafe extern "C" fn(*mut ffi::PyObject),
         dealloc_with_gc: unsafe extern "C" fn(*mut ffi::PyObject),
+        synthesized_traverse: ffi::traverseproc,
+        synthesized_clear: ffi::inquiry,
         is_mapping: bool,
         is_sequence: bool,
         is_immutable_type: bool,
@@ -69,6 +78,8 @@ where
                 tp_base: base,
                 tp_dealloc: dealloc,
                 tp_dealloc_with_gc: dealloc_with_gc,
+                synthesized_traverse,
+                synthesized_clear,
                 is_mapping,
                 is_sequence,
                 is_immutable_type,
@@ -97,6 +108,8 @@ where
             T::BaseType::type_object_raw(py),
             tp_dealloc::<T>,
             tp_dealloc_with_gc::<T>,
+            synthesized_traverse::<T>,
+            synthesized_clear::<T>,
             T::IS_MAPPING,
             T::IS_SEQUENCE,
             T::IS_IMMUTABLE_TYPE,
@@ -128,6 +141,10 @@ struct PyTypeBuilder {
     tp_base: *mut ffi::PyTypeObject,
     tp_dealloc: ffi::destructor,
     tp_dealloc_with_gc: ffi::destructor,
+    /// `tp_traverse` / `tp_clear` to install when the class needs the slot but defines no
+    /// `__traverse__` / `__clear__` of its own.
+    synthesized_traverse: ffi::traverseproc,
+    synthesized_clear: ffi::inquiry,
     is_mapping: bool,
     is_sequence: bool,
     is_immutable_type: bool,
@@ -162,13 +179,13 @@ impl PyTypeBuilder {
             ffi::Py_bf_getbuffer => {
                 // Safety: slot.pfunc is a valid function pointer
                 self.buffer_procs.bf_getbuffer =
-                    Some(unsafe { std::mem::transmute::<*mut T, ffi::getbufferproc>(pfunc) });
+                    Some(unsafe { core::mem::transmute::<*mut T, ffi::getbufferproc>(pfunc) });
             }
             #[cfg(all(not(Py_3_9), not(Py_LIMITED_API)))]
             ffi::Py_bf_releasebuffer => {
                 // Safety: slot.pfunc is a valid function pointer
                 self.buffer_procs.bf_releasebuffer =
-                    Some(unsafe { std::mem::transmute::<*mut T, ffi::releasebufferproc>(pfunc) });
+                    Some(unsafe { core::mem::transmute::<*mut T, ffi::releasebufferproc>(pfunc) });
             }
             _ => {}
         }
@@ -185,7 +202,7 @@ impl PyTypeBuilder {
         if !data.is_empty() {
             // Python expects a zeroed entry to mark the end of the defs
             unsafe {
-                data.push(std::mem::zeroed());
+                data.push(core::mem::zeroed());
                 self.push_slot(slot, Box::into_raw(data.into_boxed_slice()) as *mut c_void);
             }
         }
@@ -216,11 +233,11 @@ impl PyTypeBuilder {
     }
 
     fn finalize_methods_and_properties(&mut self) -> Vec<GetSetDefType> {
-        let method_defs: Vec<pyo3_ffi::PyMethodDef> = std::mem::take(&mut self.method_defs);
+        let method_defs: Vec<pyo3_ffi::PyMethodDef> = core::mem::take(&mut self.method_defs);
         // Safety: Py_tp_methods expects a raw vec of PyMethodDef
         unsafe { self.push_raw_vec_slot(ffi::Py_tp_methods, method_defs) };
 
-        let member_defs = std::mem::take(&mut self.member_defs);
+        let member_defs = core::mem::take(&mut self.member_defs);
         // Safety: Py_tp_members expects a raw vec of PyMemberDef
         unsafe { self.push_raw_vec_slot(ffi::Py_tp_members, member_defs) };
 
@@ -267,7 +284,7 @@ impl PyTypeBuilder {
                             let dict_ptr =
                                 object.byte_offset(dict_offset).cast::<*mut ffi::PyObject>();
                             if (*dict_ptr).is_null() {
-                                std::ptr::write(dict_ptr, ffi::PyDict_New());
+                                core::ptr::write(dict_ptr, ffi::PyDict_New());
                             }
                             Ok(ffi::compat::Py_XNewRef(*dict_ptr))
                         })
@@ -344,8 +361,7 @@ impl PyTypeBuilder {
     }
 
     fn type_doc(mut self, type_doc: &'static CStr) -> Self {
-        let slice = type_doc.to_bytes();
-        if !slice.is_empty() {
+        if !type_doc.is_empty() {
             unsafe { self.push_slot(ffi::Py_tp_doc, type_doc.as_ptr() as *mut c_char) }
 
             #[cfg(all(not(Py_LIMITED_API), not(Py_3_10)))]
@@ -357,6 +373,8 @@ impl PyTypeBuilder {
                 self.cleanup
                     .push(Box::new(move |_self, type_object| unsafe {
                         ffi::PyObject_Free((*type_object).tp_doc as _);
+
+                        let slice = type_doc.to_bytes_with_nul();
                         let data = ffi::PyMem_Malloc(slice.len());
                         data.copy_from(slice.as_ptr() as _, slice.len());
                         (*type_object).tp_doc = data as _;
@@ -389,7 +407,7 @@ impl PyTypeBuilder {
                     type_code: ffi::Py_T_PYSSIZET,
                     offset,
                     flags,
-                    doc: std::ptr::null_mut(),
+                    doc: core::ptr::null_mut(),
                 }
             }
 
@@ -460,6 +478,25 @@ impl PyTypeBuilder {
             }
         }
 
+        // A reference cycle can run through the instance `__dict__` (`obj.x = obj`), so a class
+        // with a `__dict__` must be a GC type. `_call_traverse` / `_call_clear` service the
+        // `__dict__` when the user defines `__traverse__` / `__clear__`; synthesize whichever
+        // slot they did not.
+        //
+        // Must run before the `tp_dealloc` selection below, which keys off `has_traverse`.
+        if self.dict_offset.is_some() {
+            if !self.has_traverse {
+                let synthesized_traverse = self.synthesized_traverse;
+                // Safety: This is the correct slot type for Py_tp_traverse
+                unsafe { self.push_slot(ffi::Py_tp_traverse, synthesized_traverse as *mut c_void) }
+            }
+            if !self.has_clear {
+                let synthesized_clear = self.synthesized_clear;
+                // Safety: This is the correct slot type for Py_tp_clear
+                unsafe { self.push_slot(ffi::Py_tp_clear, synthesized_clear as *mut c_void) }
+            }
+        }
+
         let base_is_gc = unsafe { ffi::PyType_IS_GC(self.tp_base) == 1 };
         let tp_dealloc = if self.has_traverse || base_is_gc {
             self.tp_dealloc_with_gc
@@ -485,8 +522,9 @@ impl PyTypeBuilder {
             assert!(self.has_traverse); // Py_TPFLAGS_HAVE_GC is set when a `__traverse__` method is found
 
             if !self.has_clear {
+                let synthesized_clear = self.synthesized_clear;
                 // Safety: This is the correct slot type for Py_tp_clear
-                unsafe { self.push_slot(ffi::Py_tp_clear, call_super_clear as *mut c_void) }
+                unsafe { self.push_slot(ffi::Py_tp_clear, synthesized_clear as *mut c_void) }
             }
         }
 
@@ -504,30 +542,60 @@ impl PyTypeBuilder {
         unsafe { self.push_slot(0, ptr::null_mut::<c_void>()) }
 
         let class_name = py_class_qualified_name(module_name, name)?;
-        let mut spec = ffi::PyType_Spec {
-            name: class_name.as_ptr() as _,
-            basicsize: basicsize as c_int,
-            itemsize: 0,
+        let flags = ffi::Py_TPFLAGS_DEFAULT | self.class_flags;
 
-            flags: (ffi::Py_TPFLAGS_DEFAULT | self.class_flags)
-                .try_into()
-                .unwrap(),
-            slots: self.slots.as_mut_ptr(),
+        #[cfg(Py_3_15)]
+        let type_object = {
+            let mut slots = [
+                ffi::PySlot_DATA(ffi::Py_tp_name, class_name.as_ptr() as *mut c_void),
+                ffi::PySlot_UINT64(ffi::Py_tp_flags, flags.into()),
+                ffi::PySlot_DATA(ffi::Py_tp_slots, self.slots.as_mut_ptr().cast::<c_void>()),
+                match basicsize {
+                    1.. => ffi::PySlot_SIZE(ffi::Py_tp_basicsize, basicsize),
+                    // zero size; don't set the slot at all, the VM will use the parent size
+                    //
+                    // This can *ONLY* be hit on the variable-sized case with a rust ZST,
+                    // as a fully-sized case will always have size at least equal to `PyObject`
+                    0 => ffi::PySlot_END(),
+                    ..0 => ffi::PySlot_SIZE(ffi::Py_tp_extra_basicsize, -basicsize),
+                },
+                // NB: insert additional slots BEFORE `basicsize` slot as it might be null
+                ffi::PySlot_END(),
+            ];
+
+            // SAFETY: We've correctly setup the slots array at this point.
+            // The FFI call is known to return a new type object or null on error.
+            unsafe {
+                ffi::PyType_FromSlots(slots.as_mut_ptr())
+                    .assume_owned_or_err(py)?
+                    .cast_into_unchecked::<PyType>()
+            }
         };
 
-        // SAFETY: We've correctly setup the PyType_Spec at this point
-        // The FFI call is known to return a new type object or null on error
-        let type_object = unsafe {
-            ffi::PyType_FromSpec(&mut spec)
-                .assume_owned_or_err(py)?
-                .cast_into_unchecked::<PyType>()
+        #[cfg(not(Py_3_15))]
+        let type_object = {
+            let mut spec = ffi::PyType_Spec {
+                name: class_name.as_ptr() as _,
+                basicsize: basicsize as c_int,
+                itemsize: 0,
+                flags: flags.try_into().unwrap(),
+                slots: self.slots.as_mut_ptr(),
+            };
+
+            // SAFETY: We've correctly setup the PyType_Spec at this point.
+            // The FFI call is known to return a new type object or null on error.
+            unsafe {
+                ffi::PyType_FromSpec(&mut spec)
+                    .assume_owned_or_err(py)?
+                    .cast_into_unchecked::<PyType>()
+            }
         };
 
         #[cfg(not(Py_3_11))]
         bpo_45315_workaround(py, class_name);
 
         #[cfg(all(not(Py_LIMITED_API), not(Py_3_10)))]
-        for cleanup in std::mem::take(&mut self.cleanup) {
+        for cleanup in core::mem::take(&mut self.cleanup) {
             cleanup(&self, type_object.as_type_ptr());
         }
 
@@ -569,7 +637,7 @@ fn bpo_45315_workaround(py: Python<'_>, class_name: CString) {
         let _ = py;
     }
 
-    std::mem::forget(class_name);
+    core::mem::forget(class_name);
 }
 
 /// Default new implementation
@@ -595,10 +663,6 @@ unsafe extern "C" fn no_constructor_defined(
     }
 }
 
-unsafe extern "C" fn call_super_clear(slf: *mut ffi::PyObject) -> c_int {
-    unsafe { _call_clear(slf, |_, _| Ok(()), call_super_clear) }
-}
-
 #[derive(Default)]
 struct GetSetDefBuilder {
     doc: Option<&'static CStr>,
@@ -611,7 +675,7 @@ impl GetSetDefBuilder {
     fn add_getter(&mut self, getter: &PyGetterDef) {
         // TODO: be smarter about merging getter and setter docs
         if self.doc.is_none() {
-            self.doc = Some(getter.doc);
+            self.doc = getter.doc;
         }
         // TODO: return an error if getter already defined?
         self.getter = Some(getter.meth)
@@ -620,7 +684,7 @@ impl GetSetDefBuilder {
     fn add_setter(&mut self, setter: &PySetterDef) {
         // TODO: be smarter about merging getter and setter docs
         if self.doc.is_none() {
-            self.doc = Some(setter.doc);
+            self.doc = setter.doc;
         }
         // TODO: return an error if setter already defined?
         self.setter = Some(setter.meth)
@@ -629,7 +693,7 @@ impl GetSetDefBuilder {
     fn add_deleter(&mut self, deleter: &PyDeleterDef) {
         // TODO: be smarter about merging getter, setter and deleter docs
         if self.doc.is_none() {
-            self.doc = Some(deleter.doc);
+            self.doc = deleter.doc;
         }
         // TODO: return an error if deleter already defined?
         self.deleter = Some(deleter.meth)
@@ -687,8 +751,9 @@ impl GetSetDefType {
                         slf: *mut ffi::PyObject,
                         closure: *mut c_void,
                     ) -> *mut ffi::PyObject {
+                        let slf = unsafe { NonNull::new_unchecked(slf) };
                         // Safety: PyO3 sets the closure when constructing the ffi getter so this cast should always be valid
-                        let getter: Getter = unsafe { std::mem::transmute(closure) };
+                        let getter: Getter = unsafe { core::mem::transmute(closure) };
                         unsafe { trampoline(|py| getter(py, slf)) }
                     }
                     (Some(getter), None, closure as Getter as _)
@@ -699,14 +764,15 @@ impl GetSetDefType {
                         value: *mut ffi::PyObject,
                         closure: *mut c_void,
                     ) -> c_int {
+                        let slf = unsafe { NonNull::new_unchecked(slf) };
                         // Safety: PyO3 sets the closure when constructing the ffi setter so this cast should always be valid
-                        let setter: Setter = unsafe { std::mem::transmute(closure) };
+                        let setter: Setter = unsafe { core::mem::transmute(closure) };
                         unsafe {
                             trampoline(|py| {
-                                if value.is_null() {
-                                    Err(PyAttributeError::new_err("property has no deleter"))
-                                } else {
+                                if let Some(value) = NonNull::new(value) {
                                     setter(py, slf, value)
+                                } else {
+                                    Err(PyAttributeError::new_err("property has no deleter"))
                                 }
                             })
                         }
@@ -718,6 +784,7 @@ impl GetSetDefType {
                         slf: *mut ffi::PyObject,
                         closure: *mut c_void,
                     ) -> *mut ffi::PyObject {
+                        let slf = unsafe { NonNull::new_unchecked(slf) };
                         let getset: &GetSetDeleteCombination = unsafe { &*closure.cast() };
                         // we only call this method if getter is set
                         unsafe { trampoline(|py| getset.getter.unwrap_unchecked()(py, slf)) }
@@ -728,17 +795,18 @@ impl GetSetDefType {
                         value: *mut ffi::PyObject,
                         closure: *mut c_void,
                     ) -> c_int {
+                        let slf = unsafe { NonNull::new_unchecked(slf) };
                         let getset: &GetSetDeleteCombination = unsafe { &*closure.cast() };
                         unsafe {
                             trampoline(|py| {
-                                if value.is_null() {
-                                    getset.deleter.ok_or_else(|| {
-                                        PyAttributeError::new_err("property has no deleter")
-                                    })?(py, slf)
-                                } else {
+                                if let Some(value) = NonNull::new(value) {
                                     getset.setter.ok_or_else(|| {
                                         PyAttributeError::new_err("property has no setter")
                                     })?(py, slf, value)
+                                } else {
+                                    getset.deleter.ok_or_else(|| {
+                                        PyAttributeError::new_err("property has no deleter")
+                                    })?(py, slf)
                                 }
                             })
                         }

@@ -296,6 +296,12 @@ impl PythonSignature {
             .checked_sub(self.default_positional_parameters.len())
             .expect("should always have positional defaults <= positional parameters")
     }
+
+    /// Makes every positional parameter positional-only, exactly as a trailing `/` in a
+    /// signature does. Deliberately leaves keyword-only parameters alone.
+    pub fn make_all_parameters_positional_only(&mut self) {
+        self.positional_only_parameters = self.positional_parameters.len();
+    }
 }
 
 #[derive(Clone)]
@@ -391,7 +397,7 @@ impl ParseState {
     ) -> syn::Result<()> {
         match self {
             ParseState::Positional => {
-                signature.positional_only_parameters = signature.positional_parameters.len();
+                signature.make_all_parameters_positional_only();
                 *self = ParseState::PositionalAfterPosargs;
                 Ok(())
             }
@@ -474,13 +480,6 @@ impl<'a> FunctionSignature<'a> {
             )
         };
 
-        if let Some(returns) = &attribute.value.returns {
-            ensure_spanned!(
-                cfg!(feature = "experimental-inspect"),
-                returns.1.span() => "Return type annotation in the signature is only supported with the `experimental-inspect` feature"
-            );
-        }
-
         for item in &attribute.value.items {
             match item {
                 SignatureItem::Argument(arg) => {
@@ -501,17 +500,11 @@ impl<'a> FunctionSignature<'a> {
                         );
                     };
                     if let Some((_, default)) = &arg.eq_and_default {
-                        fn_arg.default_value = Some(default.clone());
+                        fn_arg.default_value = Some(Box::new(default.clone()));
                     }
+                    #[cfg(feature = "experimental-inspect")]
                     if let Some((_, annotation)) = &arg.colon_and_annotation {
-                        ensure_spanned!(
-                            cfg!(feature = "experimental-inspect"),
-                            annotation.span() => "Type annotations in the signature is only supported with the `experimental-inspect` feature"
-                        );
-                        #[cfg(feature = "experimental-inspect")]
-                        {
-                            fn_arg.annotation = Some(annotation.as_type_hint());
-                        }
+                        fn_arg.annotation = Some(annotation.as_type_hint());
                     }
                 }
                 SignatureItem::VarargsSep(sep) => {
@@ -521,44 +514,32 @@ impl<'a> FunctionSignature<'a> {
                     let fn_arg = next_non_py_argument_checked(&varargs.ident)?;
                     fn_arg.to_varargs_mut()?;
                     parse_state.add_varargs(&mut python_signature, varargs)?;
+                    #[cfg(feature = "experimental-inspect")]
                     if let Some((_, annotation)) = &varargs.colon_and_annotation {
-                        ensure_spanned!(
-                            cfg!(feature = "experimental-inspect"),
-                            annotation.span() => "Type annotations in the signature is only supported with the `experimental-inspect` feature"
-                        );
-                        #[cfg(feature = "experimental-inspect")]
-                        {
-                            let FnArg::VarArgs(fn_arg) = fn_arg else {
-                                unreachable!(
+                        let FnArg::VarArgs(fn_arg) = fn_arg else {
+                            unreachable!(
                                     "`Python` and `CancelHandle` are already handled above and `*args`/`**kwargs` are \
                                 parsed and transformed below. Because the have to come last and are only allowed \
                                 once, this has to be a regular argument."
                                 );
-                            };
-                            fn_arg.annotation = Some(annotation.as_type_hint());
-                        }
+                        };
+                        fn_arg.annotation = Some(annotation.as_type_hint());
                     }
                 }
                 SignatureItem::Kwargs(kwargs) => {
                     let fn_arg = next_non_py_argument_checked(&kwargs.ident)?;
                     fn_arg.to_kwargs_mut()?;
                     parse_state.add_kwargs(&mut python_signature, kwargs)?;
+                    #[cfg(feature = "experimental-inspect")]
                     if let Some((_, annotation)) = &kwargs.colon_and_annotation {
-                        ensure_spanned!(
-                            cfg!(feature = "experimental-inspect"),
-                            annotation.span() => "Type annotations in the signature is only supported with the `experimental-inspect` feature"
-                        );
-                        #[cfg(feature = "experimental-inspect")]
-                        {
-                            let FnArg::KwArgs(fn_arg) = fn_arg else {
-                                unreachable!(
+                        let FnArg::KwArgs(fn_arg) = fn_arg else {
+                            unreachable!(
                                     "`Python` and `CancelHandle` are already handled above and `*args`/`**kwargs` are \
                                 parsed and transformed below. Because the have to come last and are only allowed \
                                 once, this has to be a regular argument."
                                 );
-                            };
-                            fn_arg.annotation = Some(annotation.as_type_hint());
-                        }
+                        };
+                        fn_arg.annotation = Some(annotation.as_type_hint());
                     }
                 }
                 SignatureItem::PosargsSep(sep) => {

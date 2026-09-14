@@ -1,16 +1,17 @@
 #![allow(missing_docs)]
 //! Crate-private implementation of PyClassObject
 
-use std::cell::UnsafeCell;
-use std::marker::PhantomData;
-use std::mem::{offset_of, ManuallyDrop, MaybeUninit};
-use std::ptr::addr_of_mut;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::mem::{offset_of, ManuallyDrop, MaybeUninit};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::impl_::pyclass::{
     PyClassBaseType, PyClassDict, PyClassImpl, PyClassThreadChecker, PyClassWeakRef, PyObjectOffset,
 };
 use crate::internal::get_slot::{TP_DEALLOC, TP_FREE};
+#[cfg(RustPython)]
+use crate::sync::PyOnceLock;
 use crate::type_object::{PyLayout, PySizedLayout, PyTypeInfo};
 use crate::types::PyType;
 use crate::{ffi, PyClass, Python};
@@ -262,19 +263,44 @@ unsafe fn tp_dealloc(slf: *mut ffi::PyObject, type_obj: &crate::Bound<'_, PyType
         // FIXME: there is potentially subtle issues here if the base is overwritten
         // at runtime? To be investigated.
         let type_ptr = type_obj.as_type_ptr();
-        let actual_type = PyType::from_borrowed_type_ptr(py, ffi::Py_TYPE(slf));
+        let actual_type_ptr = ffi::Py_TYPE(slf);
+
+        // For heap types, instances must decref the type object  when they
+        // are deallocated, so we create a bound from a borrowed pointer as
+        // as if it was an owned pointer. In this way, when the bound is dropped,
+        // it will decref the type object.
+        debug_assert!(ffi::PyType_HasFeature(actual_type_ptr, ffi::Py_TPFLAGS_HEAPTYPE) != 0);
+        let actual_type = cfg_select! {
+            not(PyPy) => crate::Bound::from_owned_ptr(py, actual_type_ptr as *mut ffi::PyObject)
+                .cast_into_unchecked::<PyType>(),
+            // See https://github.com/pypy/pypy/issues/5555 - it seems that PyPy does not
+            // support the CPython semantics properly, so we avoid taking ownership of the
+            // type object on PyPy.
+            //
+            // TODO: If the PyPy bug is fixed we should remove this workaround and just create
+            // a `Bound` as above.
+            PyPy => crate::Borrowed::from_ptr(py, actual_type_ptr as *mut ffi::PyObject)
+                .cast_unchecked::<PyType>(),
+        };
 
         // For `#[pyclass]` types which inherit from PyAny, we can just call tp_free
-        if std::ptr::eq(type_ptr, std::ptr::addr_of!(ffi::PyBaseObject_Type)) {
+        #[cfg(not(RustPython))]
+        let base_object_type_ptr = &raw const ffi::PyBaseObject_Type;
+        #[cfg(RustPython)]
+        let base_object_type_ptr = {
+            static TYPE: PyOnceLock<crate::Py<PyType>> = PyOnceLock::new();
+            TYPE.import(py, "builtins", "object").unwrap().as_type_ptr()
+        };
+
+        if core::ptr::eq(type_ptr, base_object_type_ptr) {
             let tp_free = actual_type
                 .get_slot(TP_FREE)
                 .expect("PyBaseObject_Type should have tp_free");
-            return tp_free(slf.cast());
+            tp_free(slf.cast());
         }
-
         // More complex native types (e.g. `extends=PyDict`) require calling the base's dealloc.
         // FIXME: should this be using actual_type.tp_dealloc?
-        if let Some(dealloc) = type_obj.get_slot(TP_DEALLOC) {
+        else if let Some(dealloc) = type_obj.get_slot(TP_DEALLOC) {
             // Before CPython 3.11 BaseException_dealloc would use Py_GC_UNTRACK which
             // assumes the exception is currently GC tracked, so we have to re-track
             // before calling the dealloc so that it can safely call Py_GC_UNTRACK.
@@ -286,6 +312,14 @@ unsafe fn tp_dealloc(slf: *mut ffi::PyObject, type_obj: &crate::Bound<'_, PyType
         } else {
             type_obj.get_slot(TP_FREE).expect("type missing tp_free")(slf.cast());
         }
+
+        // Cause the reference to the type to be decrefed for heap types, which
+        // is necessary to avoid a reference leak.
+        #[cfg_attr(
+            PyPy,
+            expect(dropping_copy_types, reason = "see PyPy workaround for decref above")
+        )]
+        drop(actual_type);
     }
 }
 
@@ -368,7 +402,7 @@ impl<T: PyClassImpl> PyClassObjectContents<T> {
         if self.thread_checker.can_drop(py) {
             unsafe { ManuallyDrop::drop(&mut self.value) };
         }
-        self.dict.clear_dict(py);
+        self.dict.release_dict(py);
         unsafe { self.weakref.clear_weakrefs(py_object, py) };
     }
 }
@@ -390,7 +424,7 @@ impl<T: PyClassImpl<Layout = Self>> PyClassObjectLayout<T> for PyStaticClassObje
     };
 
     const BASIC_SIZE: ffi::Py_ssize_t = {
-        let size = std::mem::size_of::<Self>();
+        let size = core::mem::size_of::<Self>();
         assert!(size <= ffi::Py_ssize_t::MAX as usize);
         size as _
     };
@@ -418,7 +452,7 @@ impl<T: PyClassImpl<Layout = Self>> PyClassObjectLayout<T> for PyStaticClassObje
             contents: MaybeUninit<PyClassObjectContents<T>>,
         }
         let obj = obj.cast::<PartiallyInitializedClassObject<T>>();
-        unsafe { addr_of_mut!((*obj).contents) }
+        unsafe { &raw mut (*obj).contents }
     }
 
     fn contents(&self) -> &PyClassObjectContents<T> {
@@ -505,7 +539,7 @@ impl<T: PyClass<Layout = Self>> PyClassObjectLayout<T> for PyVariableClassObject
     /// Gets the offset of the contents from the start of the struct in bytes.
     const CONTENTS_OFFSET: PyObjectOffset = PyObjectOffset::Relative(0);
     const BASIC_SIZE: ffi::Py_ssize_t = {
-        let size = std::mem::size_of::<PyClassObjectContents<T>>();
+        let size = core::mem::size_of::<PyClassObjectContents<T>>();
         assert!(size <= ffi::Py_ssize_t::MAX as usize);
         // negative to indicate 'extra' space that cpython will allocate for us
         -(size as ffi::Py_ssize_t)
@@ -626,6 +660,9 @@ mod tests {
     struct ImmutableChildOfImmutableChildOfImmutableBase;
 
     #[pyclass(crate = "crate", subclass)]
+    struct BaseWithoutData;
+
+    #[pyclass(crate = "crate", subclass)]
     struct BaseWithData(#[allow(unused)] u64);
 
     #[pyclass(crate = "crate", extends = BaseWithData)]
@@ -636,13 +673,32 @@ mod tests {
 
     #[test]
     fn test_inherited_size() {
-        let base_size = PyStaticClassObject::<BaseWithData>::BASIC_SIZE;
-        assert!(base_size > 0); // negative indicates variable sized
-        assert_eq!(
-            base_size,
-            PyStaticClassObject::<ChildWithoutData>::BASIC_SIZE
-        );
-        assert!(base_size < PyStaticClassObject::<ChildWithData>::BASIC_SIZE);
+        #[cfg(all(Py_LIMITED_API, Py_GIL_DISABLED))]
+        type ClassObject<T> = PyVariableClassObject<T>;
+        #[cfg(not(all(Py_LIMITED_API, Py_GIL_DISABLED)))]
+        type ClassObject<T> = PyStaticClassObject<T>;
+
+        let base_without_data_size = ClassObject::<BaseWithoutData>::BASIC_SIZE;
+        let base_with_data_size = ClassObject::<BaseWithData>::BASIC_SIZE;
+        let child_without_data_size = ClassObject::<ChildWithoutData>::BASIC_SIZE;
+        let child_with_data_size = ClassObject::<ChildWithData>::BASIC_SIZE;
+        #[cfg(all(Py_LIMITED_API, Py_GIL_DISABLED))]
+        {
+            assert!(base_without_data_size < 0); // negative indicates variable sized
+            assert!(base_with_data_size < base_without_data_size);
+            assert_eq!(child_without_data_size, 0);
+            assert_eq!(
+                base_with_data_size - base_without_data_size,
+                child_with_data_size
+            );
+        }
+        #[cfg(not(all(Py_LIMITED_API, Py_GIL_DISABLED)))]
+        {
+            assert!(base_without_data_size > 0);
+            assert!(base_with_data_size > base_without_data_size);
+            assert_eq!(base_with_data_size, child_without_data_size);
+            assert!(base_with_data_size < child_with_data_size);
+        }
     }
 
     fn assert_mutable<T: PyClass<Frozen = False, PyClassMutability = MutableClass>>() {}

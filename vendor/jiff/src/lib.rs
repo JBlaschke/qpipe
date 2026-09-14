@@ -629,6 +629,16 @@ For more, see the [`fmt::serde`] sub-module. (This requires enabling Jiff's
   (for example, when using `wasm-pack`). Only binary, tests and benchmarks
   should enable this feature. See
   [Platform support](crate::_documentation::platform) for more details.
+* **defmt** -
+  When enabled, Jiff will implement the [`defmt::Format`] trait for many
+  of its types. This is useful for embedded environments where the usual
+  `core::fmt` machinery is not practical to use. Note that, at time of writing
+  (2026-06-12), not all public types in this crate implement [`defmt::Format`].
+  If there are types for which you need `defmt` support but don't have it in
+  Jiff, then please [open a new issue][issue-new].
+* **arbitrary** -
+  When enabled, `Arbitrary` trait implementations (for the `arbitrary` crate)
+  are provided for many of Jiff's core datetime primitives.
 
 ### Time zone features
 
@@ -636,8 +646,7 @@ For more, see the [`fmt::serde`] sub-module. (This requires enabling Jiff's
   When enabled, Jiff will include code that attempts to determine the "system"
   time zone. For example, on Unix systems, this is usually determined by
   looking at the symlink information on `/etc/localtime`. But in general, it's
-  very platform specific and heuristic oriented. On some platforms, this may
-  require extra dependencies. (For example, `windows-sys` on Windows.)
+  very platform specific and heuristic oriented.
 * **tz-fat** (enabled by default) -
   When enabled, Jiff will "fatten" time zone data with extra transitions to
   make time zone lookups faster. This may result in increased heap memory
@@ -687,6 +696,7 @@ For more, see the [`fmt::serde`] sub-module. (This requires enabling Jiff's
 [`jiff-static`]: https://docs.rs/jiff-static
 [`jiff-tzdb`]: https://docs.rs/jiff-tzdb
 [Concatenated Time Zone Database]: https://android.googlesource.com/platform/libcore/+/jb-mr2-release/luni/src/main/java/libcore/util/ZoneInfoDB.java
+[issue-new]: https://github.com/BurntSushi/jiff/issues/new
 */
 
 #![no_std]
@@ -748,6 +758,12 @@ extern crate std;
 #[cfg(any(test, feature = "alloc"))]
 extern crate alloc;
 
+/// This is NOT part of Jiff's public API.
+///
+/// This is exported for use by `jiff-static`'s procedural macro.
+#[doc(hidden)]
+pub use jcore as __jcore;
+
 pub use crate::{
     error::Error,
     signed_duration::{SignedDuration, SignedDurationRound},
@@ -775,8 +791,6 @@ mod error;
 pub mod fmt;
 #[cfg(feature = "std")]
 mod now;
-#[doc(hidden)]
-pub mod shared;
 mod signed_duration;
 mod span;
 mod timestamp;
@@ -824,7 +838,7 @@ mod tests {
         dbg!((b::SpanMilliseconds::MIN, b::SpanMilliseconds::MAX));
         dbg!((b::SpanMicroseconds::MIN, b::SpanMicroseconds::MAX));
         dbg!((b::SpanNanoseconds::MIN, b::SpanNanoseconds::MAX));
-        dbg!((b::UnixSeconds::MIN, b::UnixSeconds::MAX));
+        dbg!((b::UnixEpochSeconds::MIN, b::UnixEpochSeconds::MAX));
         dbg!((b::UnixEpochDays::MIN, b::UnixEpochDays::MAX));
     }
 

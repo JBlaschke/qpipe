@@ -71,8 +71,16 @@ Flow control (--in-flight)
   Seeds are gated: the feeder blocks once --in-flight tasks are pending, so a
   supply-paced stream (stdin) can't out-dispatch the workers into a retry
   storm (a task's deadline is armed at dispatch). Begets are NOT gated — they
-  are self-paced by completions; a very wide discovery tree can still grow the
-  queue (acceptable near branching factor 1; revisit if you fan out hugely).
+  are self-paced by completions.
+
+  The one thing the coordinator must never do is block on the work pipe while
+  it owns the completions pipe: the orchestrator's queue is bounded (10 000
+  frames) and a full queue withholds the ACK, so a coordinator stuck in
+  work.send() stops draining completions, the workers fill THAT queue with
+  begets/dones and stall in control.send(), and nobody can move — a deadlock
+  the moment one BFS level of the discovery tree is wider than the queue.
+  Sends therefore go through an unbounded in-process outbox drained by a
+  dedicated sender thread; the completions loop only ever blocks in recv().
 
 Effect convention (the house rule)
   A side effect is legitimate only if (a) it is the function's stated job —
@@ -96,6 +104,8 @@ import socket
 import argparse
 import threading
 import subprocess
+
+from collections import deque
 
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from dataclasses     import dataclass
@@ -533,15 +543,41 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
     loop_done = threading.Event()
     finishing = threading.Event()
     finish_lock = threading.Lock()
-    send_lock = threading.Lock()
+    outbox: deque[tuple[int, int, Spec]] = deque()
+    outbox_cv = threading.Condition()
 
     with qpipe.Producer.connect(pipes.work, codec="json") as work, \
          qpipe.Consumer.connect(pipes.completions, codec="json") as control:
 
         def push(task: int, attempt: int, spec: Spec) -> None:
-            """The one effect on the work pipe; serialized across threads."""
-            with send_lock:
-                work.send({"task": task, "attempt": attempt, "spec": spec})
+            """
+            Queue one work frame for the sender thread. Never blocks: the
+            outbox is unbounded, so a beget wider than the orchestrator's
+            queue cannot stall the completions loop (see Flow control).
+            """
+            with outbox_cv:
+                outbox.append((task, attempt, spec))
+                outbox_cv.notify()
+
+        def send_loop() -> None:
+            """
+            The one effect on the work pipe. Drains the outbox in order; the
+            blocking work.send() (a full orchestrator queue withholds its ACK)
+            is confined here, where blocking is harmless. Ends on loop_done
+            once the outbox is empty; a dying pipe ends it early.
+            """
+            while True:
+                with outbox_cv:
+                    while not outbox and not loop_done.is_set():
+                        outbox_cv.wait(0.5)
+                    if not outbox:
+                        return              # loop_done and nothing left
+                    task, attempt, spec = outbox.popleft()
+                try:
+                    work.send({"task": task, "attempt": attempt, "spec": spec})
+                except Exception as e:  # noqa: BLE001 — pipe going away
+                    log(f"[{name}] work pipe send failed: {e}")
+                    return
 
         def apply(decision: Decision) -> None:
             """Interpret one ledger Decision — the algebra's only consumer."""
@@ -634,6 +670,7 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
                     finish()
 
         feeder = threading.Thread(target=feed, daemon=True)
+        sender = threading.Thread(target=send_loop, daemon=True)
         watchdog = threading.Thread(
             target=_coordinator_watchdog,
             kwargs=dict(name=name, ledger=ledger, apply=apply, finish=finish,
@@ -644,6 +681,7 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
         )
 
         try:
+            sender.start()
             feeder.start()
             watchdog.start()
 
@@ -662,6 +700,9 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
 
         finally:
             loop_done.set()
+            with outbox_cv:
+                outbox_cv.notify_all()
+            sender.join(timeout=5.0)    # flush stragglers before the drain
 
     finish()                        # no-op if the watchdog beat us to it
     return _summarize(name, ledger.stats(), elapsed=time.monotonic() - t0)

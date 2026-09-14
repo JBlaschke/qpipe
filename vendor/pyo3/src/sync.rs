@@ -1,3 +1,6 @@
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 //! Synchronization mechanisms which are aware of the existence of the Python interpreter.
 //!
 //! The Python interpreter has multiple "stop the world" situations which may block threads, such as
@@ -15,12 +18,8 @@ use crate::{
     types::{PyAny, PyString},
     Bound, Py, Python,
 };
-use std::{
-    cell::UnsafeCell,
-    marker::PhantomData,
-    mem::MaybeUninit,
-    sync::{Once, OnceState},
-};
+use core::{cell::UnsafeCell, marker::PhantomData, mem::MaybeUninit};
+use std::sync::{Once, OnceState};
 
 pub mod critical_section;
 pub(crate) mod once_lock;
@@ -89,11 +88,13 @@ impl<T> Default for GILOnceCell<T> {
     }
 }
 
+// SAFETY: Sync is only implemented if the inner type is Sync
 // T: Send is needed for Sync because the thread which drops the GILOnceCell can be different
 // to the thread which fills it. (e.g. think scoped thread which fills the cell and then exits,
 // leaving the cell to be dropped by the main thread).
 #[allow(deprecated)]
 unsafe impl<T: Send + Sync> Sync for GILOnceCell<T> {}
+// SAFETY: send is only implemented if the inner type is send
 #[allow(deprecated)]
 unsafe impl<T: Send> Send for GILOnceCell<T> {}
 
@@ -454,7 +455,7 @@ impl<R: lock_api::RawMutex, T> MutexExt<T> for lock_api::Mutex<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R, T> MutexExt<T> for std::sync::Arc<lock_api::Mutex<R, T>>
+impl<R, T> MutexExt<T> for alloc::sync::Arc<lock_api::Mutex<R, T>>
 where
     R: lock_api::RawMutex,
 {
@@ -499,7 +500,7 @@ where
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R, G, T> MutexExt<T> for std::sync::Arc<lock_api::ReentrantMutex<R, G, T>>
+impl<R, G, T> MutexExt<T> for alloc::sync::Arc<lock_api::ReentrantMutex<R, G, T>>
 where
     R: lock_api::RawMutex,
     G: lock_api::GetThreadId,
@@ -615,7 +616,7 @@ impl<R: lock_api::RawRwLock, T> RwLockExt<T> for lock_api::RwLock<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R, T> RwLockExt<T> for std::sync::Arc<lock_api::RwLock<R, T>>
+impl<R, T> RwLockExt<T> for alloc::sync::Arc<lock_api::RwLock<R, T>>
 where
     R: lock_api::RawRwLock,
 {
@@ -719,7 +720,7 @@ mod rwlock_ext_sealed {
     #[cfg(feature = "lock_api")]
     impl<R, T> Sealed for lock_api::RwLock<R, T> {}
     #[cfg(feature = "arc_lock")]
-    impl<R, T> Sealed for std::sync::Arc<lock_api::RwLock<R, T>> {}
+    impl<R, T> Sealed for alloc::sync::Arc<lock_api::RwLock<R, T>> {}
 }
 
 #[cfg(test)]
@@ -729,7 +730,7 @@ mod tests {
     use crate::types::{PyAnyMethods, PyDict, PyDictMethods};
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(feature = "macros")]
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, Ordering};
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(feature = "macros")]
     use std::sync::Barrier;
@@ -882,7 +883,7 @@ mod tests {
                     let b = mutex.lock_py_attached(py).unwrap();
                     barrier.wait();
                     // sleep to ensure the other thread actually blocks
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(core::time::Duration::from_millis(10));
                     (*b).bind(py).borrow().0.store(true, Ordering::Release);
                     drop(b);
                 });
@@ -917,7 +918,7 @@ mod tests {
                             let b: $guard = mutex.lock_py_attached(py);
                             barrier.wait();
                             // sleep to ensure the other thread actually blocks
-                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::thread::sleep(core::time::Duration::from_millis(10));
                             (*b).bind(py).borrow().0.store(true, Ordering::Release);
                             drop(b);
                         });
@@ -948,14 +949,14 @@ mod tests {
         test_mutex!(parking_lot::ArcMutexGuard<_, _>, |py| {
             let mutex =
                 parking_lot::Mutex::new(Py::new(py, BoolWrapper(AtomicBool::new(false))).unwrap());
-            std::sync::Arc::new(mutex)
+            alloc::sync::Arc::new(mutex)
         });
 
         #[cfg(feature = "arc_lock")]
         test_mutex!(parking_lot::ArcReentrantMutexGuard<_, _, _>, |py| {
             let mutex =
                 parking_lot::ReentrantMutex::new(Py::new(py, BoolWrapper(AtomicBool::new(false))).unwrap());
-            std::sync::Arc::new(mutex)
+            alloc::sync::Arc::new(mutex)
         });
     }
 
@@ -1002,7 +1003,7 @@ mod tests {
                     let b = rwlock.write_py_attached(py).unwrap();
                     barrier.wait();
                     // sleep to ensure the other thread actually blocks
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(core::time::Duration::from_millis(10));
                     (*b).bind(py).borrow().0.store(true, Ordering::Release);
                     drop(b);
                 });
@@ -1037,7 +1038,7 @@ mod tests {
                     barrier.wait();
 
                     // sleep to ensure the other thread actually blocks
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(core::time::Duration::from_millis(10));
 
                     // The bool must still be false (i.e., the writer did not actually write the
                     // value yet).
@@ -1082,7 +1083,7 @@ mod tests {
                             let b: $write_guard = rwlock.write_py_attached(py);
                             barrier.wait();
                             // sleep to ensure the other thread actually blocks
-                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::thread::sleep(core::time::Duration::from_millis(10));
                             (*b).bind(py).borrow().0.store(true, Ordering::Release);
                             drop(b);
                         });
@@ -1115,7 +1116,7 @@ mod tests {
                 let rwlock = parking_lot::RwLock::new(
                     Py::new(py, BoolWrapper(AtomicBool::new(false))).unwrap(),
                 );
-                std::sync::Arc::new(rwlock)
+                alloc::sync::Arc::new(rwlock)
             }
         );
     }
@@ -1140,7 +1141,7 @@ mod tests {
                             barrier.wait();
 
                             // sleep to ensure the other thread actually blocks
-                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::thread::sleep(core::time::Duration::from_millis(10));
 
                             // The bool must still be false (i.e., the writer did not actually write the
                             // value yet).
@@ -1184,7 +1185,7 @@ mod tests {
                 let rwlock = parking_lot::RwLock::new(
                     Py::new(py, BoolWrapper(AtomicBool::new(false))).unwrap(),
                 );
-                std::sync::Arc::new(rwlock)
+                alloc::sync::Arc::new(rwlock)
             }
         );
     }

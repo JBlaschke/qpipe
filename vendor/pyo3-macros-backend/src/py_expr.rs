@@ -5,7 +5,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use std::borrow::Cow;
 use syn::visit_mut::{visit_type_mut, VisitMut};
-use syn::{Expr, ExprLit, ExprPath, Lifetime, Lit, Type};
+use syn::{Expr, ExprLit, ExprPath, Lit, Type};
 
 /// A Python expression
 ///
@@ -16,6 +16,8 @@ pub enum PyExpr {
     FromPyObjectType(Type),
     /// The Python type hint of a IntoPyObject implementation
     IntoPyObjectType(Type),
+    /// The Python type hint of a IntoPyObject implementation on the ref type or the base type
+    IntoPyObjectMaybeRefType(Type),
     /// The Python type matching the given Rust type given as a function argument
     ArgumentType(Type),
     /// The Python type matching the given Rust type given as a function returned value
@@ -66,7 +68,7 @@ pub enum PyConstant {
 }
 
 impl PyExpr {
-    /// Build from a builtins name like `None`
+    /// Build from a builtins name like `str`
     pub fn builtin(name: impl Into<Cow<'static, str>>) -> Self {
         Self::Name { id: name.into() }
     }
@@ -91,6 +93,13 @@ impl PyExpr {
     /// If self_type is set, self_type will replace Self in the given type
     pub fn from_into_py_object(t: Type, self_type: Option<&Type>) -> Self {
         Self::IntoPyObjectType(clean_type(t, self_type))
+    }
+
+    /// The type hint of a `IntoPyObject` implementation used by a field getter
+    ///
+    /// If self_type is set, self_type will replace Self in the given type
+    pub fn from_into_py_object_maybe_ref(t: Type, self_type: Option<&Type>) -> Self {
+        Self::IntoPyObjectMaybeRefType(clean_type(t, self_type))
     }
 
     /// The type hint of the Rust type used as a function argument
@@ -174,6 +183,11 @@ impl PyExpr {
         Self::Constant(PyConstant::Ellipsis)
     }
 
+    /// `None`
+    pub fn none() -> Self {
+        Self::Constant(PyConstant::None)
+    }
+
     pub fn to_introspection_token_stream(&self, pyo3_crate_path: &PyO3CratePath) -> TokenStream {
         match self {
             Self::FromPyObjectType(t) => {
@@ -181,6 +195,15 @@ impl PyExpr {
             }
             Self::IntoPyObjectType(t) => {
                 quote! { <#t as #pyo3_crate_path::IntoPyObject<'_>>::OUTPUT_TYPE }
+            }
+            Self::IntoPyObjectMaybeRefType(t) => {
+                quote! {{
+                    #[allow(unused_imports)]
+                    use #pyo3_crate_path::impl_::pyclass::Probe as _;
+                    <#t as #pyo3_crate_path::impl_::introspection::PyIntoPyObjectMaybeRefType<{
+                        #pyo3_crate_path::impl_::pyclass::IsIntoPyObjectRef::<#t>::VALUE
+                    }>>::OUTPUT_TYPE
+                }}
             }
             Self::ArgumentType(t) => {
                 quote! {
@@ -268,24 +291,8 @@ fn clean_type(mut t: Type, self_type: Option<&Type>) -> Type {
     if let Some(self_type) = self_type {
         replace_self(&mut t, self_type);
     }
-    elide_lifetimes(&mut t);
+    crate::utils::elide_lifetimes(&mut t);
     t
-}
-
-/// Replaces all explicit lifetimes in `self` with elided (`'_`) lifetimes
-///
-/// This is useful if `Self` is used in `const` context, where explicit
-/// lifetimes are not allowed (yet).
-fn elide_lifetimes(ty: &mut Type) {
-    struct ElideLifetimesVisitor;
-
-    impl VisitMut for ElideLifetimesVisitor {
-        fn visit_lifetime_mut(&mut self, l: &mut Lifetime) {
-            *l = Lifetime::new("'_", l.span());
-        }
-    }
-
-    ElideLifetimesVisitor.visit_type_mut(ty);
 }
 
 // Replace Self in types with the given type

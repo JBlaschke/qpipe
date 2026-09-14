@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use crate::combine_errors::CombineErrors;
 #[cfg(feature = "experimental-inspect")]
+use crate::get_doc;
+#[cfg(feature = "experimental-inspect")]
 use crate::introspection::{attribute_introspection_code, function_introspection_code};
 #[cfg(feature = "experimental-inspect")]
 use crate::method::{FnSpec, FnType};
@@ -24,7 +26,7 @@ use syn::{
     ImplItemFn, Result,
 };
 #[cfg(feature = "experimental-inspect")]
-use syn::{parse_quote, Ident};
+use syn::{parse_quote, Ident, ReturnType};
 
 /// The mechanism used to collect `#[pymethods]` into the type object
 #[derive(Copy, Clone)]
@@ -138,7 +140,13 @@ pub fn impl_methods(
                     check_pyfunction(&ctx.pyo3_path, meth)?;
                     let method = PyMethod::parse(&mut meth.sig, &mut meth.attrs, fun_options)?;
                     #[cfg(feature = "experimental-inspect")]
-                    extra_fragments.push(method_introspection_code(&method.spec, ty, ctx));
+                    extra_fragments.push(method_introspection_code(
+                        &method.spec,
+                        &meth.attrs,
+                        ty,
+                        method.is_returning_not_implemented_on_extraction_error(),
+                        ctx,
+                    ));
                     match pymethod::gen_py_method(ty, method, &meth.attrs, ctx)? {
                         GeneratedPyMethod::Method(MethodAndMethodDef {
                             associated_method,
@@ -165,6 +173,8 @@ pub fn impl_methods(
                 }
                 syn::ImplItem::Const(konst) => {
                     let ctx = &Ctx::new(&options.krate, None);
+                    #[cfg(feature = "experimental-inspect")]
+                    let doc = get_doc(&konst.attrs, None);
                     let attributes = ConstAttributes::from_attrs(&mut konst.attrs)?;
                     if attributes.is_class_attr {
                         let spec = ConstSpec {
@@ -174,6 +184,8 @@ pub fn impl_methods(
                             expr: Some(konst.expr.clone()),
                             #[cfg(feature = "experimental-inspect")]
                             ty: konst.ty.clone(),
+                            #[cfg(feature = "experimental-inspect")]
+                            doc,
                         };
                         let attrs = get_cfg_attributes(&konst.attrs);
                         let MethodAndMethodDef {
@@ -260,6 +272,7 @@ pub fn gen_py_const(cls: &syn::Type, spec: &ConstSpec, ctx: &Ctx) -> MethodAndMe
             .as_ref()
             .map_or_else(PyExpr::ellipsis, PyExpr::constant_from_expression),
         spec.ty.clone(),
+        spec.doc.as_ref(),
         true,
     ));
 
@@ -370,7 +383,13 @@ pub(crate) fn get_cfg_attributes(attrs: &[syn::Attribute]) -> Vec<&syn::Attribut
 }
 
 #[cfg(feature = "experimental-inspect")]
-pub fn method_introspection_code(spec: &FnSpec<'_>, parent: &syn::Type, ctx: &Ctx) -> TokenStream {
+pub fn method_introspection_code(
+    spec: &FnSpec<'_>,
+    attrs: &[syn::Attribute],
+    parent: &syn::Type,
+    is_returning_not_implemented_on_extraction_error: bool,
+    ctx: &Ctx,
+) -> TokenStream {
     let Ctx { pyo3_path, .. } = ctx;
 
     let name = spec.python_name.to_string();
@@ -388,7 +407,17 @@ pub fn method_introspection_code(spec: &FnSpec<'_>, parent: &syn::Type, ctx: &Ct
                 // We cant to keep the first argument type, hence this hack
                 spec.signature.arguments.pop();
                 spec.signature.python_signature.positional_parameters.pop();
-                method_introspection_code(&spec, parent, ctx)
+                // the `CompareOp` parameter is gone; keep the positional-only count in range
+                spec.signature
+                    .python_signature
+                    .make_all_parameters_positional_only();
+                method_introspection_code(
+                    &spec,
+                    attrs,
+                    parent,
+                    is_returning_not_implemented_on_extraction_error,
+                    ctx,
+                )
             })
             .collect();
     }
@@ -445,17 +474,31 @@ pub fn method_introspection_code(spec: &FnSpec<'_>, parent: &syn::Type, ctx: &Ct
         }
         FnType::FnModule(_) => (), // TODO: not sure this can happen
         FnType::ClassAttribute => {
-            first_argument = Some("cls");
-            // TODO: this combination only works with Python 3.9-3.11 https://docs.python.org/3.11/library/functions.html#classmethod
-            decorators.push(PyExpr::builtin("classmethod"));
-            decorators.push(PyExpr::builtin("property"));
+            // We return an attribute because there is no decorator for this case
+            return attribute_introspection_code(
+                pyo3_path,
+                Some(parent),
+                name,
+                PyExpr::ellipsis(),
+                if let ReturnType::Type(_, t) = &spec.output {
+                    (**t).clone()
+                } else {
+                    parse_quote!(#pyo3_path::Py<#pyo3_path::types::PyNone>)
+                },
+                get_doc(attrs, None).as_ref(),
+                true,
+            );
         }
     }
     let return_type = if spec.python_name == "__new__" {
         // Hack to return Self while implementing IntoPyObject
-        parse_quote!(-> #pyo3_path::PyRef<Self>)
+        // TODO: use typing.Self?
+        PyExpr::from_return_type(parse_quote!(#pyo3_path::PyClassGuard<Self>), Some(parent))
     } else {
-        spec.output.clone()
+        match spec.output.clone() {
+            ReturnType::Type(_, t) => PyExpr::from_return_type(*t, Some(parent)),
+            ReturnType::Default => PyExpr::none(),
+        }
     };
     function_introspection_code(
         pyo3_path,
@@ -466,6 +509,8 @@ pub fn method_introspection_code(spec: &FnSpec<'_>, parent: &syn::Type, ctx: &Ct
         return_type,
         decorators,
         spec.asyncness.is_some(),
+        is_returning_not_implemented_on_extraction_error,
+        get_doc(attrs, None).as_ref(),
         Some(parent),
     )
 }

@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "76f2a9eb651a361da25721981ff988c40d61ff6c"
+    "sha1": "4100a7c71125b9523029566d1d18f8b227ecd18c"
   },
-  "path_in_vcs": ""
+  "path_in_vcs": "crates/jiff"
 }

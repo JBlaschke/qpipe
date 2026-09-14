@@ -1,18 +1,18 @@
 use crate::moduleobject::PyModuleDef;
 use crate::object::PyObject;
 use crate::pytypedefs::{PyInterpreterState, PyThreadState};
-use std::ffi::c_int;
+use core::ffi::c_int;
 
 #[cfg(any(all(Py_3_9, not(Py_LIMITED_API)), Py_3_10))]
 #[cfg(not(PyPy))]
 use crate::PyFrameObject;
 
 #[cfg(not(PyPy))]
-use std::ffi::c_long;
+use core::ffi::c_long;
 
 pub const MAX_CO_EXTRA_USERS: c_int = 255;
 
-extern "C" {
+extern_libpython! {
     #[cfg(not(PyPy))]
     pub fn PyInterpreterState_New() -> *mut PyInterpreterState;
     #[cfg(not(PyPy))]
@@ -23,7 +23,7 @@ extern "C" {
     #[cfg(all(Py_3_9, not(PyPy)))]
     pub fn PyInterpreterState_Get() -> *mut PyInterpreterState;
 
-    #[cfg(all(Py_3_8, not(PyPy)))]
+    #[cfg(not(PyPy))]
     pub fn PyInterpreterState_GetDict(arg1: *mut PyInterpreterState) -> *mut PyObject;
 
     #[cfg(not(PyPy))]
@@ -53,7 +53,7 @@ pub unsafe fn PyThreadState_GET() -> *mut PyThreadState {
     PyThreadState_Get()
 }
 
-extern "C" {
+extern_libpython! {
     #[cfg_attr(PyPy, link_name = "PyPyThreadState_Swap")]
     pub fn PyThreadState_Swap(arg1: *mut PyThreadState) -> *mut PyThreadState;
     #[cfg_attr(PyPy, link_name = "PyPyThreadState_GetDict")]
@@ -79,18 +79,6 @@ pub enum PyGILState_STATE {
     PyGILState_UNLOCKED,
 }
 
-#[cfg(not(any(Py_3_14, target_arch = "wasm32")))]
-struct HangThread;
-
-#[cfg(not(any(Py_3_14, target_arch = "wasm32")))]
-impl Drop for HangThread {
-    fn drop(&mut self) {
-        loop {
-            std::thread::park(); // Block forever.
-        }
-    }
-}
-
 // The PyGILState_Ensure function will call pthread_exit during interpreter shutdown,
 // which causes undefined behavior. Redirect to the "safe" version that hangs instead,
 // as Python 3.14 does.
@@ -101,13 +89,13 @@ impl Drop for HangThread {
 // pthread_exit from PyGILState_Ensure (https://github.com/python/cpython/issues/87135).
 mod raw {
     #[cfg(not(any(Py_3_14, target_arch = "wasm32")))]
-    extern "C-unwind" {
+    extern_libpython! { "C-unwind" {
         #[cfg_attr(PyPy, link_name = "PyPyGILState_Ensure")]
         pub fn PyGILState_Ensure() -> super::PyGILState_STATE;
-    }
+    }}
 
     #[cfg(any(Py_3_14, target_arch = "wasm32"))]
-    extern "C" {
+    extern_libpython! {
         #[cfg_attr(PyPy, link_name = "PyPyGILState_Ensure")]
         pub fn PyGILState_Ensure() -> super::PyGILState_STATE;
     }
@@ -115,7 +103,7 @@ mod raw {
 
 #[cfg(not(any(Py_3_14, target_arch = "wasm32")))]
 pub unsafe extern "C" fn PyGILState_Ensure() -> PyGILState_STATE {
-    let guard = HangThread;
+    let guard = crate::impl_::HangThread;
     // If `PyGILState_Ensure` calls `pthread_exit`, which it does on Python < 3.14
     // when the interpreter is shutting down, this will cause a forced unwind.
     // doing a forced unwind through a function with a Rust destructor is unspecified
@@ -135,14 +123,14 @@ pub unsafe extern "C" fn PyGILState_Ensure() -> PyGILState_STATE {
     // nothing we can do it other than waiting for Python 3.14 or not using Windows. At least,
     // if there is nothing pinned on the stack, it won't cause the process to crash.
     let ret: PyGILState_STATE = raw::PyGILState_Ensure();
-    std::mem::forget(guard);
+    core::mem::forget(guard);
     ret
 }
 
 #[cfg(any(Py_3_14, target_arch = "wasm32"))]
 pub use self::raw::PyGILState_Ensure;
 
-extern "C" {
+extern_libpython! {
     #[cfg_attr(PyPy, link_name = "PyPyGILState_Release")]
     pub fn PyGILState_Release(arg1: PyGILState_STATE);
     #[cfg(not(PyPy))]

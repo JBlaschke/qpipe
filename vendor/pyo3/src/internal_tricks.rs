@@ -1,3 +1,5 @@
+use core::ptr::NonNull;
+
 use crate::ffi::{self, Py_ssize_t, PY_SSIZE_T_MAX};
 
 macro_rules! pyo3_exception {
@@ -24,7 +26,7 @@ pub(crate) fn clear_eq(f: Option<ffi::inquiry>, g: ffi::inquiry) -> bool {
     #[expect(clippy::incompatible_msrv, reason = "guarded by cfg(fn_ptr_eq)")]
     {
         let Some(f) = f else { return false };
-        std::ptr::fn_addr_eq(f, g)
+        core::ptr::fn_addr_eq(f, g)
     }
 
     #[cfg(not(fn_ptr_eq))]
@@ -39,11 +41,24 @@ pub(crate) fn traverse_eq(f: Option<ffi::traverseproc>, g: ffi::traverseproc) ->
     #[expect(clippy::incompatible_msrv, reason = "guarded by cfg(fn_ptr_eq)")]
     {
         let Some(f) = f else { return false };
-        std::ptr::fn_addr_eq(f, g)
+        core::ptr::fn_addr_eq(f, g)
     }
 
     #[cfg(not(fn_ptr_eq))]
     {
         f == Some(g)
     }
+}
+
+// TODO: use Box::into_non_null when stabilized
+pub(crate) fn box_into_non_null<T>(b: Box<T>) -> NonNull<T> {
+    // SAFETY: `Box::into_raw` guarantees an non-null pointer
+    unsafe { NonNull::new_unchecked(Box::into_raw(b)) }
+}
+
+/// Replacement for the unstable `<*mut [T; N]>::as_mut_ptr` method, which avoids
+/// possibility of type getting lost from using e.g. `.cast()` to change array
+/// type to point to the data.
+pub(crate) const fn array_ptr_as_mut<T, const N: usize>(ptr: *mut [T; N]) -> *mut T {
+    ptr.cast()
 }

@@ -46,8 +46,6 @@ use crate::exceptions::{PyTypeError, PyUserWarning, PyValueError};
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
 use crate::intern;
-#[cfg(feature = "experimental-inspect")]
-use crate::type_object::PyTypeInfo;
 use crate::types::any::PyAnyMethods;
 use crate::types::PyNone;
 use crate::types::{PyDate, PyDateTime, PyDelta, PyTime, PyTzInfo, PyTzInfoAccess};
@@ -60,6 +58,8 @@ use crate::{
     types::{PyString, PyStringMethods},
     Py,
 };
+#[cfg(feature = "experimental-inspect")]
+use crate::{type_hint_identifier, PyTypeInfo};
 use crate::{Borrowed, Bound, FromPyObject, IntoPyObjectExt, PyAny, PyErr, PyResult, Python};
 use chrono::offset::{FixedOffset, Utc};
 #[cfg(feature = "chrono-local")]
@@ -415,7 +415,7 @@ impl<'py> IntoPyObject<'py> for FixedOffset {
     type Error = PyErr;
 
     #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyTzInfo::TYPE_HINT;
+    const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("datetime", "timezone");
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let seconds_offset = self.local_minus_utc();
@@ -477,7 +477,7 @@ impl<'py> IntoPyObject<'py> for Utc {
     type Error = PyErr;
 
     #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyTzInfo::TYPE_HINT;
+    const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("datetime", "timezone");
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         PyTzInfo::utc(py)
@@ -501,8 +501,11 @@ impl<'py> IntoPyObject<'py> for &Utc {
 impl FromPyObject<'_, '_> for Utc {
     type Error = PyErr;
 
+    #[cfg(feature = "experimental-inspect")]
+    const INPUT_TYPE: PyStaticExpr = Utc::OUTPUT_TYPE;
+
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
-        let py_utc = PyTzInfo::utc(ob.py())?;
+        let py_utc = Utc.into_pyobject(ob.py())?;
         if ob.eq(py_utc)? {
             Ok(Utc)
         } else {
@@ -517,7 +520,10 @@ impl<'py> IntoPyObject<'py> for Local {
     type Output = Borrowed<'static, 'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
+    #[cfg(all(feature = "experimental-inspect", Py_3_9))]
+    const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("zoneinfo", "ZoneInfo");
+
+    #[cfg(all(feature = "experimental-inspect", not(Py_3_9)))]
     const OUTPUT_TYPE: PyStaticExpr = PyTzInfo::TYPE_HINT;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
@@ -552,6 +558,9 @@ impl<'py> IntoPyObject<'py> for &Local {
 #[cfg(feature = "chrono-local")]
 impl FromPyObject<'_, '_> for Local {
     type Error = PyErr;
+
+    #[cfg(feature = "experimental-inspect")]
+    const INPUT_TYPE: PyStaticExpr = Local::OUTPUT_TYPE;
 
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Local> {
         let local_tz = Local.into_pyobject(ob.py())?;
@@ -626,7 +635,7 @@ fn warn_truncated_leap_second(obj: &Bound<'_, PyAny>) {
 
 #[cfg(not(Py_LIMITED_API))]
 fn py_date_to_naive_date(
-    py_date: impl std::ops::Deref<Target = impl PyDateAccess>,
+    py_date: impl core::ops::Deref<Target = impl PyDateAccess>,
 ) -> PyResult<NaiveDate> {
     NaiveDate::from_ymd_opt(
         py_date.get_year(),
@@ -648,7 +657,7 @@ fn py_date_to_naive_date(py_date: &Bound<'_, PyAny>) -> PyResult<NaiveDate> {
 
 #[cfg(not(Py_LIMITED_API))]
 fn py_time_to_naive_time(
-    py_time: impl std::ops::Deref<Target = impl PyTimeAccess>,
+    py_time: impl core::ops::Deref<Target = impl PyTimeAccess>,
 ) -> PyResult<NaiveTime> {
     NaiveTime::from_hms_micro_opt(
         py_time.get_hour().into(),
@@ -706,7 +715,8 @@ fn py_datetime_to_datetime_with_timezone<Tz: TimeZone>(
 mod tests {
     use super::*;
     use crate::{test_utils::assert_warnings, types::PyTuple, BoundObject};
-    use std::{cmp::Ordering, panic};
+    use core::cmp::Ordering;
+    use std::panic;
 
     #[test]
     // Only Python>=3.9 has the zoneinfo package
@@ -1303,8 +1313,8 @@ mod tests {
         use super::*;
         use crate::test_utils::CatchWarnings;
         use crate::types::IntoPyDict;
+        use alloc::ffi::CString;
         use proptest::prelude::*;
-        use std::ffi::CString;
 
         proptest! {
 

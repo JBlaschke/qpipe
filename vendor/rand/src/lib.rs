@@ -7,37 +7,24 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! Utilities for random number generation
-//!
-//! Rand provides utilities to generate random numbers, to convert them to
-//! useful types and distributions, and some randomness-related algorithms.
+//! Random-number generators and samplers
 //!
 //! # Quick Start
 //!
 //! ```
-//! // The prelude import enables methods we use below, specifically
-//! // Rng::random, Rng::sample, SliceRandom::shuffle and IndexedRandom::choose.
-//! use rand::prelude::*;
+//! // rand::random() supports many common types:
+//! println!("Uniform i8 sample: {}", match rand::random() {
+//!     0i8 => "zero",
+//!     i if i > 0 => "positive",
+//!     _ => "negative",
+//! });
 //!
-//! // Get an RNG:
-//! let mut rng = rand::rng();
-//!
-//! // Try printing a random unicode code point (probably a bad idea)!
-//! println!("char: '{}'", rng.random::<char>());
-//! // Try printing a random alphanumeric value instead!
-//! println!("alpha: '{}'", rng.sample(rand::distr::Alphanumeric) as char);
-//!
-//! // Generate and shuffle a sequence:
-//! let mut nums: Vec<i32> = (1..100).collect();
-//! nums.shuffle(&mut rng);
-//! // And take a random pick (yes, we didn't need to shuffle first!):
-//! let _ = nums.choose(&mut rng);
+//! // Ranged sampling:
+//! use std::f32::consts::PI;
+//! println!("Angle: {} degrees", rand::random_range(-PI..PI));
 //! ```
 //!
-//! # The Book
-//!
-//! For the user guide and further documentation, please read
-//! [The Rust Rand Book](https://rust-random.github.io/book).
+//! See also [The Book: Quick Start](https://rust-random.github.io/book/quick-start.html).
 
 #![doc(
     html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk.png",
@@ -71,9 +58,6 @@ pub use rand_core;
 // Re-exports from rand_core
 pub use rand_core::{CryptoRng, Rng, SeedableRng, TryCryptoRng, TryRng};
 
-#[macro_use]
-mod log_macros;
-
 // Public modules
 pub mod distr;
 pub mod prelude;
@@ -102,6 +86,11 @@ use crate::distr::{Distribution, StandardUniform};
 /// # let _ = rand::Rng::next_u32(&mut rng);
 /// ```
 ///
+/// # Panics
+///
+/// If [`SysRng`] fails to obtain entropy from the OS. This is unlikely
+/// outside of early boot or unusual system conditions.
+///
 /// # Security
 ///
 /// Refer to [`ThreadRng#Security`].
@@ -110,6 +99,7 @@ use crate::distr::{Distribution, StandardUniform};
 /// [`ThreadRng`]: crate::rngs::ThreadRng
 /// [`ThreadRng#Security`]: crate::rngs::ThreadRng#security
 #[cfg(feature = "sys_rng")]
+#[track_caller]
 pub fn make_rng<R: SeedableRng>() -> R {
     #[cfg(feature = "thread_rng")]
     {
@@ -238,7 +228,7 @@ where
 /// let words: Vec<&str> = "Mary had a little lamb".split(' ').collect();
 /// println!("{}", words[rand::random_range(..words.len())]);
 /// ```
-/// Note that the first example can also be achieved (without `collect`'ing
+/// Note that the second example can also be achieved (without `collect`'ing
 /// to a `Vec`) using [`seq::IteratorRandom::choose`].
 #[cfg(feature = "thread_rng")]
 #[inline]

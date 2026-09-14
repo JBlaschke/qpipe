@@ -17,4 +17,21 @@ End-to-end through the real `orchestrator` binary. Requires `maturin develop
 --uv` first and the binary on PATH (or set QPIPE_ORCHESTRATOR_BIN). Marked so
 they can be deselected.
 
+### test_work.py
+
+`qpipe.work` harness (coordinator / worker roles) driven through in-process
+fake pipes that keep the orchestrator's one load-bearing property: a bounded
+queue whose `send()` blocks while full. Fast tier — no binary, no sockets.
+Regression for the coordinator deadlock on a beget wider than the pipes
+(blocking `work.send()` inside the completions-reading loop); fails within
+seconds with a listing of where each harness thread is parked instead of
+hanging the run.
+
+### test_e2e_work.py
+
+The same regression against three real `orchestrator ADDR 50` processes (the
+`orchestrator_factory` fixture in conftest.py passes the CAPACITY positional
+argument), so the queue-full path is reached by a 400-child beget rather than
+a 20 000-directory tree. e2e-marked like the rest.
+
 

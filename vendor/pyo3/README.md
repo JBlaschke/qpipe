@@ -19,7 +19,7 @@
 Requires Rust 1.83 or greater.
 
 PyO3 supports the following Python distributions:
-  - CPython 3.7 or greater
+  - CPython 3.8 or greater
   - PyPy 7.3 (Python 3.11+)
   - GraalPy 25.0 or greater (Python 3.12+)
 
@@ -71,7 +71,7 @@ name = "string_sum"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = "0.28.3"
+pyo3 = "0.29.2"
 ```
 
 **`src/lib.rs`**
@@ -102,6 +102,8 @@ $ python
 >>> string_sum.sum_as_string(5, 20)
 '25'
 ```
+
+When checking runtime performance, run `maturin develop --release` to build with optimizations.
 
 To make changes to the package, just edit the Rust source code and then re-run `maturin develop` to recompile.
 
@@ -137,7 +139,7 @@ Start a new project with `cargo new` and add  `pyo3` to the `Cargo.toml` like th
 
 ```toml
 [dependencies.pyo3]
-version = "0.28.3"
+version = "0.29.2"
 # Enabling this cargo feature will cause PyO3 to start a Python interpreter on first call to `Python::attach`
 features = ["auto-initialize"]
 ```
@@ -183,6 +185,7 @@ about this topic.
 
 ## Examples
 
+- [anise](https://github.com/nyx-space/anise) _A modern, high-performance toolkit for spacecraft mission design, notably used to help softly land Firefly Blue Ghost on the Moon on 02 Feb 2025._
 - [arro3](https://github.com/kylebarron/arro3) _A minimal Python library for Apache Arrow, connecting to the Rust arrow crate._
     - [arro3-compute](https://github.com/kylebarron/arro3/tree/main/arro3-compute) _`arro3-compute`_
     - [arro3-core](https://github.com/kylebarron/arro3/tree/main/arro3-core) _`arro3-core`_
@@ -206,6 +209,7 @@ about this topic.
 - [geo-index](https://github.com/kylebarron/geo-index) _A Rust crate and [Python library](https://github.com/kylebarron/geo-index/tree/main/python) for packed, immutable, zero-copy spatial indexes._
 - [granian](https://github.com/emmett-framework/granian) _A Rust HTTP server for Python applications._
 - [haem](https://github.com/BooleanCat/haem) _A Python library for working on Bioinformatics problems._
+- [hifitime](https://github.com/nyx-space/hifitime) _A high fidelity time management library for engineering and scientific applications where general relativity and time dilation matter._
 - [html2text-rs](https://github.com/deedy5/html2text_rs) _Python library for converting HTML to markup or plain text._
 - [html-py-ever](https://github.com/PyO3/setuptools-rust/tree/main/examples/html-py-ever) _Using [html5ever](https://github.com/servo/html5ever) through [kuchiki](https://github.com/kuchiki-rs/kuchiki) to speed up html parsing and css-selecting._
 - [hudi-rs](https://github.com/apache/hudi-rs) _The native Rust implementation for Apache Hudi, with C++ & Python API bindings._
@@ -217,10 +221,12 @@ about this topic.
 - [opendal](https://github.com/apache/opendal/tree/main/bindings/python) _A data access layer that allows users to easily and efficiently retrieve data from various storage services in a unified way._
 - [orjson](https://github.com/ijl/orjson) _Fast Python JSON library._
 - [ormsgpack](https://github.com/aviramha/ormsgpack) _Fast Python msgpack library._
+- [pdfcrate](https://github.com/ratazzi/pdfcrate) _An ergonomic, high-level PDF generation library for Rust and Python — a Prawn-style layout API for composing documents, not low-level PDF plumbing._
 - [polars](https://github.com/pola-rs/polars) _Fast multi-threaded DataFrame library in Rust | Python | Node.js._
 - [pycrdt](https://github.com/jupyter-server/pycrdt) _Python bindings for the Rust CRDT implementation [Yrs](https://github.com/y-crdt/y-crdt)._
 - [pydantic-core](https://github.com/pydantic/pydantic-core) _Core validation logic for pydantic written in Rust._
 - [primp](https://github.com/deedy5/primp) _The fastest python HTTP client that can impersonate web browsers by mimicking their headers and TLS/JA3/JA4/HTTP2 fingerprints._
+- [quebec](https://github.com/ratazzi/quebec) _A database-backed background job queue for Python, inspired by Rails' Solid Queue._
 - [radiate](https://github.com/pkalivas/radiate): _A high-performance evolution engine for genetic programming and evolutionary algorithms._
 - [rateslib](https://github.com/attack68/rateslib) _A fixed income library for Python using Rust extensions._
 - [river](https://github.com/online-ml/river) _Online machine learning in python, the computationally heavy statistics algorithms are implemented in Rust._
@@ -228,6 +234,7 @@ about this topic.
 - [rust-python-coverage](https://github.com/cjermain/rust-python-coverage) _Example PyO3 project with automated test coverage for Rust and Python._
 - [rnet](https://github.com/0x676e67/rnet) Asynchronous Python HTTP Client with Black Magic
 - [sail](https://github.com/lakehq/sail) _Unifying stream, batch, and AI workloads with Apache Spark compatibility._
+- [tibs](https://github.com/scott-griffiths/tibs) _A sleek Python library for binary data._
 - [tiktoken](https://github.com/openai/tiktoken) _A fast BPE tokeniser for use with OpenAI's models._
 - [tokenizers](https://github.com/huggingface/tokenizers/tree/main/bindings/python) _Python bindings to the Hugging Face tokenizers (NLP) written in Rust._
 - [tzfpy](http://github.com/ringsaturn/tzfpy) _A fast package to convert longitude/latitude to timezone name._
@@ -280,4 +287,4 @@ Python is licensed under the [Python License](https://docs.python.org/3/license.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in PyO3 by you, as defined in the Apache License, shall be dual-licensed as above, without any additional terms or conditions.
 
-<a href="https://www.netlify.com"> <img src="https://www.netlify.com/v3/img/components/netlify-color-accent.svg" alt="Deploys by Netlify" /> </a>
+[![Deploys by Netlify](https://www.netlify.com/assets/badges/netlify-badge-color-accent.svg)](https://www.netlify.com)

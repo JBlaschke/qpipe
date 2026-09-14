@@ -1,7 +1,6 @@
-use std::{cmp, collections, hash};
+use core::{cmp, hash};
+use std::collections;
 
-#[cfg(feature = "experimental-inspect")]
-use crate::inspect::types::TypeInfo;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_subscript, PyStaticExpr};
 #[cfg(feature = "experimental-inspect")]
@@ -9,10 +8,7 @@ use crate::type_object::PyTypeInfo;
 use crate::{
     conversion::{FromPyObjectOwned, IntoPyObject},
     types::{
-        any::PyAnyMethods,
-        frozenset::PyFrozenSetMethods,
-        set::{try_new_from_iter, PySetMethods},
-        PyFrozenSet, PySet,
+        any::PyAnyMethods, frozenset::PyFrozenSetMethods, set::PySetMethods, PyFrozenSet, PySet,
     },
     Borrowed, Bound, FromPyObject, PyAny, PyErr, Python,
 };
@@ -30,12 +26,7 @@ where
     const OUTPUT_TYPE: PyStaticExpr = type_hint_subscript!(PySet::TYPE_HINT, K::OUTPUT_TYPE);
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        try_new_from_iter(py, self)
-    }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::set_of(K::type_output())
+        PySet::new(py, self)
     }
 }
 
@@ -51,12 +42,7 @@ where
     const OUTPUT_TYPE: PyStaticExpr = type_hint_subscript!(PySet::TYPE_HINT, <&K>::OUTPUT_TYPE);
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        try_new_from_iter(py, self.iter())
-    }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::set_of(<&K>::type_output())
+        PySet::new(py, self)
     }
 }
 
@@ -88,11 +74,6 @@ where
             }
         }
     }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_input() -> TypeInfo {
-        TypeInfo::set_of(K::type_input())
-    }
 }
 
 impl<'py, K> IntoPyObject<'py> for collections::BTreeSet<K>
@@ -107,12 +88,7 @@ where
     const OUTPUT_TYPE: PyStaticExpr = type_hint_subscript!(PySet::TYPE_HINT, K::OUTPUT_TYPE);
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        try_new_from_iter(py, self)
-    }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::set_of(K::type_output())
+        PySet::new(py, self)
     }
 }
 
@@ -129,12 +105,7 @@ where
     const OUTPUT_TYPE: PyStaticExpr = type_hint_subscript!(PySet::TYPE_HINT, <&K>::OUTPUT_TYPE);
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        try_new_from_iter(py, self.iter())
-    }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_output() -> TypeInfo {
-        TypeInfo::set_of(<&K>::type_output())
+        PySet::new(py, self)
     }
 }
 
@@ -165,18 +136,14 @@ where
             }
         }
     }
-
-    #[cfg(feature = "experimental-inspect")]
-    fn type_input() -> TypeInfo {
-        TypeInfo::set_of(K::type_input())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::types::{any::PyAnyMethods, PyFrozenSet, PySet};
     use crate::{IntoPyObject, Python};
-    use std::collections::{BTreeSet, HashSet};
+    use alloc::collections::BTreeSet;
+    use std::collections::HashSet;
 
     #[test]
     fn test_extract_hashset() {

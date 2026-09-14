@@ -282,8 +282,8 @@ struct UnsendableChild {}
 #[pymethods]
 impl UnsendableChild {
     #[new]
-    fn new(value: usize) -> (UnsendableChild, UnsendableBase) {
-        (UnsendableChild {}, UnsendableBase::new(value))
+    fn new(value: usize) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(UnsendableBase::new(value)).add_subclass(UnsendableChild {})
     }
 }
 
@@ -478,6 +478,85 @@ fn access_dunder_dict() {
     });
 }
 
+#[cfg(any(Py_3_9, not(Py_LIMITED_API)))]
+#[test]
+fn dunder_dict_is_released() {
+    Python::attach(|py| {
+        let inst = Py::new(
+            py,
+            DunderDictSupport {
+                _pad: *b"DEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+            },
+        )
+        .unwrap();
+
+        inst.setattr(py, "a", 1).unwrap();
+
+        let dict = inst.bind(py).getattr("__dict__").unwrap();
+        let get_refcnt = || {
+            // SAFETY: `dict` holds a valid reference while its reference count is read.
+            unsafe { pyo3::ffi::Py_REFCNT(dict.as_ptr()) }
+        };
+        let refcnt = get_refcnt();
+
+        drop(inst);
+
+        assert_eq!(get_refcnt(), refcnt - 1);
+        py_assert!(py, dict, "dict == {'a': 1}");
+    });
+}
+
+// The `__dict__` slot must hold exactly what CPython's `tp_new` left there: CPython 3.11
+// and 3.12 eagerly create the instance dict in `object.__new__` for types with a nonzero
+// `tp_dictoffset`, and the pyclass contents initialization must preserve it rather than
+// clobber it. All other versions create the dict lazily on first access.
+#[cfg(all(not(Py_LIMITED_API), not(PyPy), not(GraalPy)))]
+#[test]
+fn instance_dict_slot_is_not_clobbered() {
+    Python::attach(|py| {
+        let inst = Py::new(
+            py,
+            DunderDictSupport {
+                _pad: *b"DEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+            },
+        )
+        .unwrap();
+
+        // Read the `__dict__` slot directly (see `_PyObject_GetDictPtr`), *without*
+        // going through `__dict__`.
+        // SAFETY: `inst` is a valid object whose type has a positive `tp_dictoffset`.
+        let read_slot = || unsafe {
+            let offset = (*pyo3::ffi::Py_TYPE(inst.as_ptr())).tp_dictoffset;
+            assert!(offset > 0);
+            *inst
+                .as_ptr()
+                .cast::<u8>()
+                .offset(offset)
+                .cast::<*mut pyo3::ffi::PyObject>()
+        };
+
+        let slot_dict = read_slot();
+        if cfg!(all(Py_3_11, not(Py_3_13))) {
+            // `object.__new__` created the dict; it must survive pyclass initialization.
+            assert!(
+                !slot_dict.is_null(),
+                "the eagerly created __dict__ was clobbered during pyclass initialization"
+            );
+            // The slot holds the only reference to it.
+            // SAFETY: previous assert guarantees it's a valid PyObject
+            assert_eq!(unsafe { pyo3::ffi::Py_REFCNT(slot_dict) }, 1);
+        } else {
+            // No eager creation on these versions; the slot starts out empty.
+            assert!(slot_dict.is_null());
+        }
+
+        // Whichever way the dict comes into existence, `__dict__` must be the dict
+        // stored in the slot.
+        let dict_attr = inst.bind(py).getattr("__dict__").unwrap();
+        assert_eq!(read_slot(), dict_attr.as_ptr());
+    });
+}
+
 // If the base class has dict support, child class also has dict
 #[cfg(any(Py_3_9, not(Py_LIMITED_API)))]
 #[pyclass(extends=DunderDictSupport)]
@@ -489,16 +568,11 @@ struct InheritDict {
 #[cfg(any(Py_3_9, not(Py_LIMITED_API)))]
 fn inherited_dict() {
     Python::attach(|py| {
-        let inst = Py::new(
-            py,
-            (
-                InheritDict { _value: 0 },
-                DunderDictSupport {
-                    _pad: *b"DEADBEEFDEADBEEFDEADBEEFDEADBEEF",
-                },
-            ),
-        )
-        .unwrap();
+        let initializer = PyClassInitializer::from(DunderDictSupport {
+            _pad: *b"DEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+        })
+        .add_subclass(InheritDict { _value: 0 });
+        let inst = Py::new(py, initializer).unwrap();
         py_run!(
             py,
             inst,
@@ -572,16 +646,11 @@ struct InheritWeakRef {
 #[cfg(any(Py_3_9, not(Py_LIMITED_API)))]
 fn inherited_weakref() {
     Python::attach(|py| {
-        let inst = Py::new(
-            py,
-            (
-                InheritWeakRef { _value: 0 },
-                WeakRefSupport {
-                    _pad: *b"DEADBEEFDEADBEEFDEADBEEFDEADBEEF",
-                },
-            ),
-        )
-        .unwrap();
+        let initializer = PyClassInitializer::from(WeakRefSupport {
+            _pad: *b"DEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+        })
+        .add_subclass(InheritWeakRef { _value: 0 });
+        let inst = Py::new(py, initializer).unwrap();
         py_run!(
             py,
             inst,
@@ -617,7 +686,6 @@ fn access_frozen_class_without_gil() {
 }
 
 #[test]
-#[cfg(Py_3_8)]
 #[cfg_attr(target_arch = "wasm32", ignore)]
 fn drop_unsendable_elsewhere() {
     use std::sync::{

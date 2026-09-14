@@ -1,12 +1,12 @@
 use std::env;
 
-use pyo3_build_config::pyo3_build_script_impl::{cargo_env_var, errors::Result};
-use pyo3_build_config::{
-    add_python_framework_link_args, bail, print_feature_cfgs, InterpreterConfig,
+use pyo3_build_config::pyo3_build_script_impl::{
+    cargo_env_var, errors::Result, print_feature_cfgs,
 };
+use pyo3_build_config::{add_libpython_rpath_link_args, bail, InterpreterConfig};
 
 fn ensure_auto_initialize_ok(interpreter_config: &InterpreterConfig) -> Result<()> {
-    if cargo_env_var("CARGO_FEATURE_AUTO_INITIALIZE").is_some() && !interpreter_config.shared {
+    if cargo_env_var("CARGO_FEATURE_AUTO_INITIALIZE").is_some() && !interpreter_config.shared() {
         bail!(
             "The `auto-initialize` feature is enabled, but your python installation only supports \
             embedding the Python interpreter statically. If you are attempting to run tests, or a \
@@ -43,8 +43,12 @@ fn configure_pyo3() -> Result<()> {
 
     print_feature_cfgs();
 
-    // Make `cargo test` etc work on macOS with Xcode bundled Python
-    add_python_framework_link_args();
+    // Forwards interpreter config under the links = "pyo3-python" configuration,
+    // which allows consumers of `pyo3-build-config` APIs to depend on pyo3 instead of pyo3-ffi.
+    interpreter_config.to_cargo_dep_env()?;
+
+    // Make `cargo test` etc work with non-system Python installations
+    add_libpython_rpath_link_args();
 
     Ok(())
 }

@@ -12,8 +12,8 @@ use crate::types::PyString;
 #[cfg(any(unix, target_os = "emscripten"))]
 use crate::types::{PyBytes, PyBytesMethods};
 use crate::{Borrowed, FromPyObject, PyAny, PyErr, Python};
-use std::borrow::Cow;
-use std::convert::Infallible;
+use alloc::borrow::Cow;
+use core::convert::Infallible;
 use std::ffi::{OsStr, OsString};
 #[cfg(any(unix, target_os = "emscripten"))]
 use std::os::unix::ffi::OsStrExt;
@@ -47,6 +47,7 @@ impl<'py> IntoPyObject<'py> for &OsStr {
             let bytes = self.as_bytes();
             let ptr = bytes.as_ptr().cast();
             let len = bytes.len() as ffi::Py_ssize_t;
+            // SAFETY: passing valid pointer to python API
             unsafe {
                 // DecodeFSDefault automatically chooses an appropriate decoding mechanism to
                 // parse os strings losslessly (i.e. surrogateescape most of the time)
@@ -59,6 +60,7 @@ impl<'py> IntoPyObject<'py> for &OsStr {
         #[cfg(windows)]
         {
             let wstr: Vec<u16> = self.encode_wide().collect();
+            // SAFETY: passing valid pointer to python API
             unsafe {
                 // This will not panic because the data from encode_wide is well-formed Windows
                 // string data
@@ -127,8 +129,9 @@ impl FromPyObject<'_, '_> for OsString {
 
             // Get an owned allocated wide char buffer from PyString, which we have to deallocate
             // ourselves
+            // SAFETY: passing valid pointer to python API
             let size =
-                unsafe { ffi::PyUnicode_AsWideChar(pystring.as_ptr(), std::ptr::null_mut(), 0) };
+                unsafe { ffi::PyUnicode_AsWideChar(pystring.as_ptr(), core::ptr::null_mut(), 0) };
             crate::err::error_on_minusone(ob.py(), size)?;
 
             debug_assert!(
@@ -138,6 +141,7 @@ impl FromPyObject<'_, '_> for OsString {
             let size = size - 1; // exclude null terminator
 
             let mut buffer = vec![0; size as usize];
+            // SAFETY: passing valid pointer to python API
             let bytes_read =
                 unsafe { ffi::PyUnicode_AsWideChar(pystring.as_ptr(), buffer.as_mut_ptr(), size) };
             assert_eq!(bytes_read, size);
@@ -228,15 +232,13 @@ mod tests {
     use crate::exceptions::PyFileNotFoundError;
     use crate::types::{PyAnyMethods, PyString, PyStringMethods};
     use crate::{Bound, BoundObject, IntoPyObject, Python};
-    use std::fmt::Debug;
+    use alloc::borrow::Cow;
+    use core::fmt::Debug;
+    use std::ffi::{OsStr, OsString};
     #[cfg(any(unix, target_os = "emscripten"))]
     use std::os::unix::ffi::OsStringExt;
     #[cfg(windows)]
     use std::os::windows::ffi::OsStringExt;
-    use std::{
-        borrow::Cow,
-        ffi::{OsStr, OsString},
-    };
 
     #[test]
     #[cfg(any(unix, target_os = "emscripten"))]

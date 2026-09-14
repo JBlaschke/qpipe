@@ -1,5 +1,7 @@
 use core::time::Duration as UnsignedDuration;
 
+use jcore::bounds::Sign;
+
 use crate::{
     civil::{
         Date, DateTime, DateTimeRound, DateTimeWith, Era, ISOWeekDate, Time,
@@ -12,7 +14,7 @@ use crate::{
         temporal::{self, DEFAULT_DATETIME_PARSER},
     },
     tz::{AmbiguousOffset, Disambiguation, Offset, OffsetConflict, TimeZone},
-    util::{b, round::Increment},
+    util::round::Increment,
     RoundMode, SignedDuration, Span, SpanRound, Timestamp, Unit,
 };
 
@@ -113,6 +115,13 @@ use crate::{
 ///
 /// For more information on the specific format supported, see the
 /// [`fmt::temporal`](crate::fmt::temporal) module documentation.
+///
+/// # Default value
+///
+/// For convenience, this type implements the `Default` trait. Its default
+/// value corresponds to `1970-01-01T00:00:00.000000000` in the special UTC
+/// time zone. That is, it is the Unix epoch. One can also access this value
+/// via the [`Zoned::UNIX_EPOCH`] constant.
 ///
 /// # Leap seconds
 ///
@@ -377,22 +386,21 @@ struct ZonedInner {
 }
 
 impl Zoned {
-    /// The default `Zoned` value.
+    /// The Unix epoch represented as a timestamp in the [`UTC`](TimeZone::UTC)
+    /// time zone.
     ///
-    /// This is pre-computed as a constant instead of just doing
-    /// `Zoned::new(Timestamp::default(), TimeZone::UTC)`. I had
-    /// thought the compiler wouldn't be able to optimized away that
-    /// `Zoned::new` call, but it looks like it did. However, this is a
-    /// more robust way to guarantee that `Zoned::default()` is always
-    /// fast.
-    const DEFAULT: Zoned = Zoned {
-        inner: ZonedInner {
-            timestamp: Timestamp::UNIX_EPOCH,
-            datetime: DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
-            offset: Offset::UTC,
-            time_zone: TimeZone::UTC,
-        },
-    };
+    /// The Unix epoch corresponds to the instant at `1970-01-01T00:00:00Z`.
+    ///
+    /// This is equivalent to
+    /// `Zoned::new(Timestamp::UNIX_EPOCH, TimeZone::UTC)`. This is also
+    /// equivalent to `Zoned::default()`, but it can be used in a `const`
+    /// context.
+    pub const UNIX_EPOCH: Zoned = Zoned::from_parts(
+        Timestamp::UNIX_EPOCH,
+        DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
+        Offset::UTC,
+        TimeZone::UTC,
+    );
 
     /// Returns the current system time in this system's time zone.
     ///
@@ -514,20 +522,22 @@ impl Zoned {
     /// A crate internal constructor for building a `Zoned` from its
     /// constituent parts.
     ///
-    /// This should basically never be exposed, because it can be quite tricky
-    /// to get the parts correct.
-    ///
     /// See `civil::DateTime::to_zoned` for a use case for this routine. (Why
     /// do you think? Perf!)
+    ///
+    /// This should *probably* never be exposed, because it can be quite tricky
+    /// to get the parts correct. However, pretty much everything bows at the
+    /// alter of performance, so I'm open to exporting it given sufficient
+    /// motivation. We could add debug asserts that trip when `datetime`
+    /// and `offset` are incorrect.
     #[inline]
-    pub(crate) fn from_parts(
+    pub(crate) const fn from_parts(
         timestamp: Timestamp,
-        time_zone: TimeZone,
-        offset: Offset,
         datetime: DateTime,
+        offset: Offset,
+        time_zone: TimeZone,
     ) -> Zoned {
-        let inner = ZonedInner { timestamp, datetime, offset, time_zone };
-        Zoned { inner }
+        Zoned { inner: ZonedInner { timestamp, datetime, offset, time_zone } }
     }
 
     /// Create a builder for constructing a new `Zoned` from the fields of
@@ -3231,11 +3241,12 @@ impl Zoned {
         ZonedSeries { start: self.clone(), prev: None, period, step: 0 }
     }
 
-    #[inline]
-    fn into_parts(self) -> (Timestamp, DateTime, Offset, TimeZone) {
-        let inner = self.inner;
-        let ZonedInner { timestamp, datetime, offset, time_zone } = inner;
-        (timestamp, datetime, offset, time_zone)
+    /// Returns the heap memory usage, in bytes, of this zoned.
+    ///
+    /// This does **not** include the stack size used up by this zoned.
+    /// To compute that, use `std::mem::size_of::<Zoned>()`.
+    pub fn memory_usage(&self) -> usize {
+        self.inner.time_zone.memory_usage()
     }
 }
 
@@ -3313,11 +3324,14 @@ impl Zoned {
     ///
     /// # Errors and panics
     ///
-    /// While this routine itself does not error or panic, using the value
-    /// returned may result in a panic if formatting fails. See the
-    /// documentation on [`fmt::strtime::Display`] for more information.
+    /// This will never error or panic. In particular,
+    /// [lenient mode](crate::fmt::strtime::Config::lenient) is enabled, which
+    /// means that all possible strings have some non-error interpretation.
+    /// Note that because of this, and since Jiff may add new conversion
+    /// specifiers in the future, the behavior of a format string may change
+    /// when it would otherwise be invalid.
     ///
-    /// To format in a way that surfaces errors without panicking, use either
+    /// To format in a way that surfaces errors, use either
     /// [`fmt::strtime::format`] or [`fmt::strtime::BrokenDownTime::format`].
     ///
     /// # Example
@@ -3334,6 +3348,33 @@ impl Zoned {
     ///
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    ///
+    /// # Example: errors are silently ignored
+    ///
+    /// If the formatting string is malformed in some way, then it is silently
+    /// ignored. For example, when using an invalid formatting directive:
+    ///
+    /// ```
+    /// use jiff::Zoned;
+    ///
+    /// let zdt = Zoned::UNIX_EPOCH;
+    /// let string = zdt.strftime("%Y %").to_string();
+    /// assert_eq!(string, "1970 %");
+    /// ```
+    ///
+    /// If one wants to surface errors from a formatting string, use a lower
+    /// level API:
+    ///
+    /// ```
+    /// use jiff::Zoned;
+    ///
+    /// let zdt = Zoned::UNIX_EPOCH;
+    /// assert_eq!(
+    ///     jiff::fmt::strtime::format("%Y %", &zdt).unwrap_err().to_string(),
+    ///     "strftime formatting failed: invalid format string, \
+    ///      expected byte after `%`, but found end of format string",
+    /// );
+    /// ```
     #[inline]
     pub fn strftime<'f, F: 'f + ?Sized + AsRef<[u8]>>(
         &self,
@@ -3346,7 +3387,7 @@ impl Zoned {
 impl Default for Zoned {
     #[inline]
     fn default() -> Zoned {
-        Zoned::DEFAULT
+        Zoned::UNIX_EPOCH
     }
 }
 
@@ -3450,6 +3491,17 @@ impl core::fmt::Display for Zoned {
             .precision(precision)
             .print_zoned(self, StdFmtWrite(f))
             .map_err(|_| core::fmt::Error)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Zoned {
+    fn format(&self, f: defmt::Formatter) {
+        use crate::fmt::{temporal::DEFAULT_DATETIME_PRINTER, DefmtWrite};
+
+        defmt::unwrap!(
+            DEFAULT_DATETIME_PRINTER.print_zoned(self, DefmtWrite(f))
+        );
     }
 }
 
@@ -4342,7 +4394,7 @@ impl<'a> ZonedDifference<'a> {
     fn until_with_largest_unit(&self, zdt1: &Zoned) -> Result<Span, Error> {
         let zdt2 = self.zoned;
 
-        let sign = b::Sign::from_ordinals(zdt2, zdt1);
+        let sign = Sign::from_ordinals(zdt2, zdt1);
         if sign.is_zero() {
             return Ok(Span::new());
         }
@@ -4362,7 +4414,7 @@ impl<'a> ZonedDifference<'a> {
         let (dt1, mut dt2) = (zdt1.datetime(), zdt2.datetime());
 
         let mut day_correct: i32 = 0;
-        if b::Sign::from_ordinals(dt1.time(), dt2.time()) == sign {
+        if Sign::from_ordinals(dt1.time(), dt2.time()) == sign {
             day_correct += 1;
         }
 
@@ -4374,7 +4426,7 @@ impl<'a> ZonedDifference<'a> {
         let mut zmid: Zoned = mid
             .to_zoned(tz.clone())
             .context(E::ConvertIntermediateDatetime)?;
-        if b::Sign::from_ordinals(zdt2, &zmid) == -sign {
+        if Sign::from_ordinals(zdt2, &zmid) == -sign {
             if sign.is_negative() {
                 // FIXME
                 panic!("this should be an error");
@@ -4388,7 +4440,7 @@ impl<'a> ZonedDifference<'a> {
             zmid = mid
                 .to_zoned(tz.clone())
                 .context(E::ConvertIntermediateDatetime)?;
-            if b::Sign::from_ordinals(zdt2, &zmid) == -sign {
+            if Sign::from_ordinals(zdt2, &zmid) == -sign {
                 // FIXME
                 panic!("this should be an error too");
             }
@@ -4799,7 +4851,7 @@ impl ZonedWith {
     #[inline]
     pub fn build(self) -> Result<Zoned, Error> {
         let dt = self.datetime_with.build()?;
-        let (_, _, offset, time_zone) = self.original.into_parts();
+        let ZonedInner { offset, time_zone, .. } = self.original.inner;
         let offset = self.offset.unwrap_or(offset);
         let ambiguous = self.offset_conflict.resolve(dt, offset, time_zone)?;
         ambiguous.disambiguate(self.disambiguation)

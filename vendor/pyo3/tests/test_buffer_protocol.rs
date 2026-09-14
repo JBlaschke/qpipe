@@ -1,6 +1,7 @@
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
 #![cfg(feature = "macros")]
 #![cfg(any(not(Py_LIMITED_API), Py_3_11))]
-#![warn(unsafe_op_in_unsafe_fn)]
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyBufferError;
@@ -95,7 +96,6 @@ fn test_buffer_referenced() {
 }
 
 #[test]
-#[cfg(Py_3_8)] // sys.unraisablehook not available until Python 3.8
 fn test_releasebuffer_unraisable_error() {
     use pyo3::exceptions::PyValueError;
     use test_utils::UnraisableCapture;

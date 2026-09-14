@@ -6,8 +6,14 @@ use crate::{
     py_result_ext::PyResultExt,
     Bound, PyAny, Python,
 };
+#[cfg(RustPython)]
+use crate::{
+    sync::PyOnceLock,
+    types::{PyType, PyTypeMethods},
+    Py,
+};
 use crate::{Borrowed, BoundObject, IntoPyObject, IntoPyObjectExt};
-use std::ptr;
+use core::ptr;
 
 /// Allows building a Python `frozenset` one item at a time
 pub struct PyFrozenSetBuilder<'py> {
@@ -37,8 +43,7 @@ impl<'py> PyFrozenSetBuilder<'py> {
 
         inner(
             &self.py_frozen_set,
-            key.into_pyobject(self.py_frozen_set.py())
-                .map_err(Into::into)?
+            key.into_pyobject_or_pyerr(self.py_frozen_set.py())?
                 .into_any()
                 .as_borrowed(),
         )
@@ -62,11 +67,24 @@ pub struct PyFrozenSet(PyAny);
 
 #[cfg(not(any(PyPy, GraalPy)))]
 pyobject_subclassable_native_type!(PyFrozenSet, crate::ffi::PySetObject);
-#[cfg(not(any(PyPy, GraalPy)))]
+#[cfg(all(not(any(PyPy, GraalPy)), not(RustPython)))]
 pyobject_native_type!(
     PyFrozenSet,
     ffi::PySetObject,
     pyobject_native_static_type_object!(ffi::PyFrozenSet_Type),
+    "builtins",
+    "frozenset",
+    #checkfunction=ffi::PyFrozenSet_Check
+);
+
+#[cfg(all(not(any(PyPy, GraalPy)), RustPython))]
+pyobject_native_type!(
+    PyFrozenSet,
+    ffi::PySetObject,
+    |py| {
+        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+        TYPE.import(py, "builtins", "frozenset").unwrap().as_type_ptr()
+    },
     "builtins",
     "frozenset",
     #checkfunction=ffi::PyFrozenSet_Check
@@ -93,7 +111,11 @@ impl PyFrozenSet {
     where
         T: IntoPyObject<'py>,
     {
-        try_new_from_iter(py, elements)
+        let mut builder = PyFrozenSetBuilder::new(py)?;
+        for e in elements {
+            builder.add(e)?;
+        }
+        Ok(builder.finalize())
     }
 
     /// Creates a new empty frozen set
@@ -224,30 +246,6 @@ impl ExactSizeIterator for BoundFrozenSetIterator<'_> {
     fn len(&self) -> usize {
         self.0.size_hint().0
     }
-}
-
-#[inline]
-pub(crate) fn try_new_from_iter<'py, T>(
-    py: Python<'py>,
-    elements: impl IntoIterator<Item = T>,
-) -> PyResult<Bound<'py, PyFrozenSet>>
-where
-    T: IntoPyObject<'py>,
-{
-    let set = unsafe {
-        // We create the  `Py` pointer because its Drop cleans up the set if user code panics.
-        ffi::PyFrozenSet_New(std::ptr::null_mut())
-            .assume_owned_or_err(py)?
-            .cast_into_unchecked()
-    };
-    let ptr = set.as_ptr();
-
-    for e in elements {
-        let obj = e.into_pyobject_or_pyerr(py)?;
-        err::error_on_minusone(py, unsafe { ffi::PySet_Add(ptr, obj.as_ptr()) })?;
-    }
-
-    Ok(set)
 }
 
 #[cfg(test)]

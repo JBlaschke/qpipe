@@ -1,8 +1,8 @@
 use crate::object::PyObject;
 use crate::pytypedefs::PyThreadState;
-use std::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_void};
 
-extern "C" {
+extern_libpython! {
     #[cfg_attr(PyPy, link_name = "PyPyEval_EvalCode")]
     pub fn PyEval_EvalCode(
         arg1: *mut PyObject,
@@ -39,10 +39,10 @@ extern "C" {
 #[inline]
 pub unsafe fn PyEval_CallObject(func: *mut PyObject, arg: *mut PyObject) -> *mut PyObject {
     #[allow(deprecated)]
-    PyEval_CallObjectWithKeywords(func, arg, std::ptr::null_mut())
+    PyEval_CallObjectWithKeywords(func, arg, core::ptr::null_mut())
 }
 
-extern "C" {
+extern_libpython! {
     #[cfg(not(Py_3_13))]
     #[cfg_attr(Py_3_9, deprecated(note = "Python 3.9"))]
     #[cfg_attr(PyPy, link_name = "PyPyEval_CallFunction")]
@@ -107,8 +107,6 @@ extern "C" {
 
     #[cfg_attr(PyPy, link_name = "PyPyEval_SaveThread")]
     pub fn PyEval_SaveThread() -> *mut PyThreadState;
-    #[cfg_attr(PyPy, link_name = "PyPyEval_RestoreThread")]
-    pub fn PyEval_RestoreThread(arg1: *mut PyThreadState);
 
     #[cfg(not(Py_3_13))]
     #[cfg_attr(PyPy, link_name = "PyPyEval_ThreadsInitialized")]
@@ -137,8 +135,35 @@ extern "C" {
     pub fn PyEval_AcquireThread(tstate: *mut PyThreadState);
     #[cfg_attr(PyPy, link_name = "PyPyEval_ReleaseThread")]
     pub fn PyEval_ReleaseThread(tstate: *mut PyThreadState);
-    #[cfg(not(Py_3_8))]
-    pub fn PyEval_ReInitThreads();
+}
+
+// PyEval_RestoreThread calls take_gil, which calls pthread_exit on non-main threads
+// during interpreter finalization on Python < 3.14. Redirect to the "safe" version that hangs instead,
+// as Python 3.14 does.
+// See https://github.com/rust-lang/rust/issues/135929
+// C-unwind only supported (and necessary) since 1.71. Python 3.14+ does not do
+// pthread_exit from PyEval_RestoreThread (https://github.com/python/cpython/issues/87135).
+#[cfg(not(any(Py_3_14, target_arch = "wasm32")))]
+mod raw {
+    use crate::pytypedefs::PyThreadState;
+    extern_libpython! { "C-unwind" {
+        #[cfg_attr(PyPy, link_name = "PyPyEval_RestoreThread")]
+        pub fn PyEval_RestoreThread(tstate: *mut PyThreadState);
+    }}
+}
+
+#[cfg(any(Py_3_14, target_arch = "wasm32"))]
+extern_libpython! {
+    #[cfg_attr(PyPy, link_name = "PyPyEval_RestoreThread")]
+    pub fn PyEval_RestoreThread(tstate: *mut PyThreadState);
+}
+
+#[cfg(not(any(Py_3_14, target_arch = "wasm32")))]
+pub unsafe extern "C" fn PyEval_RestoreThread(tstate: *mut PyThreadState) {
+    // Same note as in PyGILState_Ensure
+    let guard = crate::impl_::HangThread;
+    raw::PyEval_RestoreThread(tstate);
+    core::mem::forget(guard);
 }
 
 // skipped Py_BEGIN_ALLOW_THREADS

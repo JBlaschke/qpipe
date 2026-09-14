@@ -3,7 +3,7 @@
 PyO3 offers two main sets of types to interact with Python objects.
 This section of the guide expands into detail about these types and how to choose which to use.
 
-The first set of types are the [smart pointers][smart-pointers] which all Python objects are wrapped in.
+The first set of types are the smart pointers which all Python objects are wrapped in.
 These are `Py<T>`, `Bound<'py, T>`, and `Borrowed<'a, 'py, T>`.
 The [first section below](#pyo3s-smart-pointers) expands on each of these in detail and why there are three of them.
 
@@ -15,7 +15,7 @@ The [second section below](#concrete-python-types) expands on how to use these t
 
 ## PyO3's smart pointers
 
-PyO3's API offers three generic smart pointers: `Py<T>`, `Bound<'py, T>` and `Borrowed<'a, 'py, T>`.
+PyO3's API offers three generic [smart pointers](glossary.md#smart-pointer): `Py<T>`, `Bound<'py, T>` and `Borrowed<'a, 'py, T>`.
 For each of these the type parameter `T` will be filled by a [concrete Python type](#concrete-python-types).
 For example, a Python list object can be represented by `Py<PyList>`, `Bound<'py, PyList>`, and `Borrowed<'a, 'py, PyList>`.
 
@@ -202,7 +202,8 @@ let obj: &Py<PyAny> = bound.as_unbound();
 let obj: Py<PyAny> = bound.unbind();
 ```
 
-To convert between `Bound<'py, T>` and `Borrowed<'a, 'py, T>` use the `as_borrowed()` method. `Borrowed<'a, 'py, T>` has a deref coercion to `Bound<'py, T>`.
+To convert between `Bound<'py, T>` and `Borrowed<'a, 'py, T>` use the `as_borrowed()` method.
+`Borrowed<'a, 'py, T>` has a deref coercion to `Bound<'py, T>`.
 Use the `to_owned()` method to increment the Python reference count and to create a new `Bound<'py, T>` from the `Borrowed<'a, 'py, T>`.
 
 ```rust,ignore
@@ -367,5 +368,4 @@ See the [corresponding documentation in the class section of the guide](./class.
 [Borrowed]: {{#PYO3_DOCS_URL}}/pyo3/struct.Borrowed.html
 [Drop]: https://doc.rust-lang.org/std/ops/trait.Drop.html
 [PyAny]: {{#PYO3_DOCS_URL}}/pyo3/types/struct.PyAny.html
-[smart-pointers]: https://doc.rust-lang.org/book/ch15-00-smart-pointers.html
 [`FromPyObject`]: {{#PYO3_DOCS_URL}}/pyo3/conversion/trait.FromPyObject.html

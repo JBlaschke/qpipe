@@ -1,3 +1,6 @@
+// TODO https://github.com/PyO3/pyo3/issues/5487
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 //! Defines how Python calls are dispatched, see [`PyCallArgs`].for more information.
 
 use crate::ffi_ptr_ext::FfiPtrExt as _;
@@ -207,7 +210,7 @@ impl<'py> PyCallArgs<'py> for Borrowed<'_, 'py, PyTuple> {
         _: private::Token,
     ) -> PyResult<Bound<'py, PyAny>> {
         unsafe {
-            ffi::PyObject_Call(function.as_ptr(), self.as_ptr(), std::ptr::null_mut())
+            ffi::PyObject_Call(function.as_ptr(), self.as_ptr(), core::ptr::null_mut())
                 .assume_owned_or_err(function.py())
         }
     }
