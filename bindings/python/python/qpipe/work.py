@@ -4,17 +4,17 @@
 """
 qpipe.work — a work-distribution harness over qpipe.
 
-qpipe gives you pipes; this gives you work distributed over pipes. A
-pipeline author supplies two strategy objects and gets the whole harness —
-coordinator, worker pool, collector, and orchestrator supervisor — for free:
+qpipe gives you pipes; this gives you work distributed over pipes. A pipeline
+author supplies two strategy objects and gets the whole harness — coordinator,
+worker pool, collector, and orchestrator supervisor — for free:
 
     inputs ─▶ coordinator ──work──▶ worker pool ──completions──▶ coordinator
                                         │
                                         └──results──▶ collect / downstream
 
 The two patterns this replaces are one pattern
-  - work-generating (e.g. a recursive bucket listing): a seed begets more
-    work as workers discover it.
+  - work-generating (e.g. a recursive bucket listing): a seed begets more work
+    as workers discover it.
   - pipelining (e.g. a copy or status-check stream): a list of inputs feeds
     straight through, nothing begets.
   They differ in exactly one thing — whether worker output feeds back as new
@@ -55,10 +55,10 @@ What the harness guarantees so your worker can't get it wrong
     coordinator sees a task's `done`, that task's results are already enqueued.
     This is what makes the post-zero drain of the results pipe race-free.
   - beget-before-done: begets and the done ride the same producer on the
-    completions pipe (FIFO), so a task's child registrations are always
-    applied before its retirement — which is what keeps termination sound.
-  - at-least-once with timeout/permanent retry, the drain cascade, the
-    watchdog hammer, SIGTERM teardown, Ctrl-C → 130.
+    completions pipe (FIFO), so a task's child registrations are always applied
+    before its retirement — which is what keeps termination sound.
+  - at-least-once with timeout/permanent retry, the drain cascade, the watchdog
+    hammer, SIGTERM teardown, Ctrl-C → 130.
 
 Termination (one counter algebra, with the input source as the root task)
   outstanding starts at 1 — the source token. Each registered spec +1, each
@@ -69,18 +69,18 @@ Termination (one counter algebra, with the input source as the root task)
 
 Flow control (--in-flight)
   Seeds are gated: the feeder blocks once --in-flight tasks are pending, so a
-  supply-paced stream (stdin) can't out-dispatch the workers into a retry
-  storm (a task's deadline is armed at dispatch). Begets are NOT gated — they
-  are self-paced by completions.
+  supply-paced stream (stdin) can't out-dispatch the workers into a retry storm
+  (a task's deadline is armed at dispatch). Begets are NOT gated — they are
+  self-paced by completions.
 
   The one thing the coordinator must never do is block on the work pipe while
   it owns the completions pipe: the orchestrator's queue is bounded (10 000
   frames) and a full queue withholds the ACK, so a coordinator stuck in
   work.send() stops draining completions, the workers fill THAT queue with
   begets/dones and stall in control.send(), and nobody can move — a deadlock
-  the moment one BFS level of the discovery tree is wider than the queue.
-  Sends therefore go through an unbounded in-process outbox drained by a
-  dedicated sender thread; the completions loop only ever blocks in recv().
+  the moment one BFS level of the discovery tree is wider than the queue. Sends
+  therefore go through an unbounded in-process outbox drained by a dedicated
+  sender thread; the completions loop only ever blocks in recv().
 
 Effect convention (the house rule)
   A side effect is legitimate only if (a) it is the function's stated job —
@@ -113,8 +113,10 @@ from typing          import Any
 
 import qpipe
 
-__all__ = ["Permanent", "Spec", "Discovery", "Emit", "Discover", "Job",
-           "Coordinator", "Worker", "Pipeline", "Pipes", "run"]
+__all__ = [
+    "Permanent", "Spec", "Discovery", "Emit", "Discover", "Job", "Coordinator",
+    "Worker", "Pipeline", "Pipes", "run"
+]
 
 
 def log(msg: str) -> None:
@@ -156,9 +158,9 @@ class Job:
 @dataclass(frozen=True, slots=True)
 class Coordinator:
     """
-    The supply + branching strategy. `expand`'s default makes this a
-    pipelining coordinator; override it for work-generation. `key_of`'s
-    default gives every spec a fresh id; provide it to dedup by identity.
+    The supply + branching strategy. `expand`'s default makes this a pipelining
+    coordinator; override it for work-generation. `key_of`'s default gives
+    every spec a fresh id; provide it to dedup by identity.
     """
 
     seeds: Callable[[], Iterator[Spec]]
@@ -178,8 +180,8 @@ class Worker:
 class Pipeline:
     """
     Everything `run` needs to stand up a pipeline. make_coordinator and
-    make_worker are the ONLY place argparse.Namespace is seen — they close
-    the parsed config into the strategy callables, exactly as a *.from_args
+    make_worker are the ONLY place argparse.Namespace is seen — they close the
+    parsed config into the strategy callables, exactly as a *.from_args
     constructor does. add_*_args contribute role-specific CLI flags.
     """
 
@@ -237,15 +239,19 @@ class CoordinatorCfg:
 # pipe plumbing
 
 def wait_for_pipes(addrs: Sequence[str], timeout: float) -> None:
-    """Block until every listed orchestrator passes healthcheck (raises on
-    timeout)."""
+    """
+    Block until every listed orchestrator passes healthcheck (raises on
+    timeout).
+    """
     for addr in addrs:
         qpipe.wait_until_healthy(addr, timeout=timeout)
 
 
 def shutdown_pipes(addrs: Sequence[str]) -> None:
-    """Best-effort request_shutdown on every listed orchestrator (Ctrl-C /
-    hammer)."""
+    """
+    Best-effort request_shutdown on every listed orchestrator (Ctrl-C /
+    hammer).
+    """
     for addr in addrs:
         try:
             qpipe.request_shutdown(addr)
@@ -333,14 +339,16 @@ class Ledger:
     more register() calls. outstanding == 0 is global done — after seal.
 
     Sans-I/O AND sans-strategy: frames-worth-of-data go in, frozen Decision
-    values come out; it never writes a pipe, logs, or calls user code
-    (`key_of` is the single closure it holds, for dedup identity only). Its
-    lock-guarded mutation is the documented exception. Time is injected, so
+    values come out; it never writes a pipe, logs, or calls user code (`key_of`
+    is the single closure it holds, for dedup identity only). Its lock-guarded
+    mutation is the documented exception. Time is injected, so
     retry/timeout/termination tests are equality assertions on Decision lists.
     """
 
-    def __init__(self, key_of: Callable[[Spec], Hashable] | None,
-                 task_timeout: float, max_attempts: int) -> None:
+    def __init__(
+            self, key_of: Callable[[Spec], Hashable] | None, 
+            task_timeout: float, max_attempts: int
+        ) -> None:
         """Set dedup identity and policy; outstanding starts at 1 (source)."""
         self._lock = threading.Lock()
         self._key_of = key_of
@@ -377,23 +385,26 @@ class Ledger:
             return [Send(task=tid, attempt=task.attempts, spec=spec)]
 
     def seal(self) -> None:
-        """Mark the source exhausted: the root token completes (-1).
-        Idempotent."""
+        """
+        Mark the source exhausted: the root token completes (-1). Idempotent.
+        """
         with self._lock:
             if not self._sealed:
                 self._sealed = True
                 self._outstanding -= 1
 
     def spec_of(self, task_id: int) -> Spec | None:
-        """The spec of a known task, or None — used to expand a beget's
-        parent."""
+        """
+        The spec of a known task, or None — used to expand a beget's parent.
+        """
         with self._lock:
             task = self._tasks.get(task_id)
             return task.spec if task is not None else None
 
     def complete(self, task_id: int) -> list[Decision]:
-        """Retire a task on its `done` frame (no new work). Late/dup
-        no-op."""
+        """
+        Retire a task on its `done` frame (no new work). Late/dup no-op.
+        """
         with self._lock:
             task = self._tasks.get(task_id)
             if task is not None and task.state is TaskState.PENDING:
@@ -402,10 +413,12 @@ class Ledger:
                 self._done += 1
             return []
 
-    def fail_or_retry(self, task_id: int, why: str, now: float,
-                      *, permanent: bool) -> list[Decision]:
-        """Apply an `error` frame: one Retry, or one Failed. Late/dup
-        no-op."""
+    def fail_or_retry(
+            self, task_id: int, why: str, now: float, *, permanent: bool
+        ) -> list[Decision]:
+        """
+        Apply an `error` frame: one Retry, or one Failed. Late/dup no-op.
+        """
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None or task.state is not TaskState.PENDING:
@@ -424,28 +437,33 @@ class Ledger:
         return decisions
 
     def pending(self) -> int:
-        """PENDING task count (the source token excluded) — feeder
-        backpressure."""
+        """
+        PENDING task count (the source token excluded) — feeder backpressure.
+        """
         with self._lock:
             return self._outstanding - (0 if self._sealed else 1)
 
     def done(self) -> bool:
-        """True once outstanding == 0 — sealed source AND all tasks
-        terminal."""
+        """
+        True once outstanding == 0 — sealed source AND all tasks terminal.
+        """
         with self._lock:
             return self._outstanding == 0
 
     def stats(self) -> Stats:
         """Consistent snapshot for reporting and the final summary."""
         with self._lock:
-            return Stats(outstanding=self._outstanding,
-                         tasks=len(self._tasks), done=self._done,
-                         failed=tuple(self._failed), sealed=self._sealed)
+            return Stats(
+                outstanding=self._outstanding, tasks=len(self._tasks),
+                done=self._done, failed=tuple(self._failed),
+                sealed=self._sealed
+            )
 
     # -- internals (call only with self._lock held) ---------------------------
 
-    def _retry_or_fail(self, task: _Task, why: str, now: float,
-                       *, permanent: bool) -> list[Decision]:
+    def _retry_or_fail(
+            self, task: _Task, why: str, now: float, *, permanent: bool
+        ) -> list[Decision]:
         """Decide: another attempt (Retry) or terminal failure (Failed)."""
         if not permanent and task.attempts < self._max_attempts:
             self._stamp(task, now)
@@ -455,13 +473,17 @@ class Ledger:
         task.state = TaskState.FAILED
         self._outstanding -= 1
         self._failed.append((task.task_id, task.spec))
-        return [Failed(task=task.task_id, attempts=task.attempts,
-                       spec=task.spec,
-                       why=f"{why} (permanent)" if permanent else why)]
+        return [
+            Failed(
+                task=task.task_id, attempts=task.attempts, spec=task.spec,
+                why=f"{why} (permanent)" if permanent else why
+            )
+        ]
 
     def _stamp(self, task: _Task, now: float) -> None:
-        """Account for one send: bump attempts, arm the re-dispatch
-        deadline."""
+        """
+        Account for one send: bump attempts, arm the re-dispatch deadline.
+        """
         task.attempts += 1
         task.deadline = now + self._task_timeout
 
@@ -469,19 +491,18 @@ class Ledger:
 # ---------------------------------------------------------------------------
 # coordinator — stateless wiring around the ledger and the strategy
 
-def _coordinator_watchdog(*, name: str, ledger: Ledger,
-                          apply: Callable[[Decision], None],
-                          finish: Callable[[], None], pipes: Pipes,
-                          tick: float, hammer: float,
-                          loop_done: threading.Event,
-                          finishing: threading.Event) -> None:
+def _coordinator_watchdog(
+        *, name: str, ledger: Ledger, apply: Callable[[Decision], None],
+        finish: Callable[[], None], pipes: Pipes, tick: float, hammer: float,
+        loop_done: threading.Event, finishing: threading.Event
+    ) -> None:
     """
     Timer half of the coordinator. Every `tick`: apply timeout decisions and,
     if a sweep drains outstanding to zero, fire the cascade (the completions
     loop is blocked in recv(); draining its pipe is what wakes it). Then the
-    hammer: if the loop's EOF hasn't arrived `hammer` seconds after the
-    cascade fired, escalate to shutdown on work+completions (results is left
-    for a slow collector).
+    hammer: if the loop's EOF hasn't arrived `hammer` seconds after the cascade
+    fired, escalate to shutdown on work+completions (results is left for a slow
+    collector).
     """
     while not loop_done.wait(tick):
         for decision in ledger.expired(time.monotonic()):
@@ -522,21 +543,24 @@ def _summarize(name: str, stats: Stats, elapsed: float) -> int:
     return 0
 
 
-def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
-                     coordinator: Coordinator) -> int:
+def _run_coordinator(
+        name: str, pipes: Pipes, cfg: CoordinatorCfg, coordinator: Coordinator
+    ) -> int:
     """
     Coordinator entry point: feed seeds, apply the ledger's decisions until
     outstanding hits zero, fire the drain cascade, summarize.
 
     Exit codes: 0 clean, 1 partial / failed, 130 interrupted.
     """
-    wait_for_pipes((pipes.work, pipes.completions, pipes.results),
-                   timeout=pipes.wait)
+    wait_for_pipes(
+        (pipes.work, pipes.completions, pipes.results), timeout=pipes.wait
+    )
     log(f"[{name}] coordinator up")
 
-    ledger = Ledger(key_of=coordinator.key_of,
-                    task_timeout=cfg.task_timeout,
-                    max_attempts=cfg.max_attempts)
+    ledger = Ledger(
+        key_of=coordinator.key_of, task_timeout=cfg.task_timeout,
+        max_attempts=cfg.max_attempts
+    )
 
     t0 = time.monotonic()
     last_report = t0
@@ -552,8 +576,8 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
         def push(task: int, attempt: int, spec: Spec) -> None:
             """
             Queue one work frame for the sender thread. Never blocks: the
-            outbox is unbounded, so a beget wider than the orchestrator's
-            queue cannot stall the completions loop (see Flow control).
+            outbox is unbounded, so a beget wider than the orchestrator's queue
+            cannot stall the completions loop (see Flow control).
             """
             with outbox_cv:
                 outbox.append((task, attempt, spec))
@@ -593,8 +617,10 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
                         f"attempts: {why} — {_short(spec)}")
 
         def handle(msg: dict[str, Any], now: float) -> list[Decision]:
-            """Turn one completions-pipe frame into Decisions (calls the
-            strategy's expand for begets)."""
+            """
+            Turn one completions-pipe frame into Decisions (calls the
+            strategy's expand for begets).
+            """
             kind = msg.get("k")
             if kind == "done":
                 return ledger.complete(msg.get("task"))
@@ -613,8 +639,9 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
             return []
 
         def finish() -> None:
-            """Fire the drain cascade exactly once, whichever thread is
-            first."""
+            """
+            Fire the drain cascade exactly once, whichever thread is first.
+            """
             with finish_lock:
                 if finishing.is_set():
                     return
@@ -626,7 +653,8 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
                     log(f"[{name}] drain({addr}) failed: {e}")
 
         def maybe_report() -> None:
-            """Throttled progress line.
+            """
+            Throttled progress line.
 
             Side effects: stderr + its own throttle timestamp — buying rate
             limiting without threading a clock through the recv loop.
@@ -649,9 +677,9 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
             already finished by seal time (empty/tiny source), fires the
             cascade itself — otherwise the watchdog catches it within a tick.
 
-            A seeds() that raises is treated as a fatal source: log, seal
-            (the run ends partial). Per-item soft rejects are the strategy's
-            to log-and-skip.
+            A seeds() that raises is treated as a fatal source: log, seal (the
+            run ends partial). Per-item soft rejects are the strategy's to
+            log-and-skip.
             """
             n = 0
             try:
@@ -673,10 +701,11 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
         sender = threading.Thread(target=send_loop, daemon=True)
         watchdog = threading.Thread(
             target=_coordinator_watchdog,
-            kwargs=dict(name=name, ledger=ledger, apply=apply, finish=finish,
-                        pipes=pipes, tick=cfg.watchdog_tick,
-                        hammer=cfg.hammer, loop_done=loop_done,
-                        finishing=finishing),
+            kwargs=dict(
+                name=name, ledger=ledger, apply=apply, finish=finish,
+                pipes=pipes, tick=cfg.watchdog_tick, hammer=cfg.hammer,
+                loop_done=loop_done, finishing=finishing
+            ),
             daemon=True,
         )
 
@@ -714,10 +743,10 @@ def _run_coordinator(name: str, pipes: Pipes, cfg: CoordinatorCfg,
 def _worker_loop(name: str, pipes: Pipes, worker: Worker, wid: str) -> None:
     """
     One consume → process → report loop. The result-before-done and
-    beget-before-done orderings live here, not in process(): the `done`
-    frame is sent only after process() returns, and result()/discover()
-    have already ACKed. QpipeError propagates (pipes going away); Permanent
-    becomes a non-retryable error frame, anything else a retryable one.
+    beget-before-done orderings live here, not in process(): the `done` frame
+    is sent only after process() returns, and result()/discover() have already
+    ACKed. QpipeError propagates (pipes going away); Permanent becomes a
+    non-retryable error frame, anything else a retryable one.
     """
     state = worker.setup()
     n = 0
@@ -740,18 +769,31 @@ def _worker_loop(name: str, pipes: Pipes, worker: Worker, wid: str) -> None:
             except qpipe.QpipeError:
                 raise               # pipes are going away — stop
             except Permanent as e:
-                control.send({"k": "error", "task": job.task, "worker": wid,
-                              "why": str(e), "permanent": True})
+                control.send({
+                    "k": "error",
+                    "task": job.task,
+                    "worker": wid,
+                    "why": str(e),
+                    "permanent": True
+                })
                 continue
             except Exception as e:  # noqa: BLE001 — report, keep serving
-                control.send({"k": "error", "task": job.task, "worker": wid,
-                              "why": f"{type(e).__name__}: {e}",
-                              "permanent": False})
+                control.send({
+                    "k": "error",
+                    "task": job.task,
+                    "worker": wid,
+                    "why": f"{type(e).__name__}: {e}",
+                    "permanent": False
+                })
                 continue
 
-            control.send({"k": "done", "task": job.task,
-                          "attempt": job.attempt, "worker": wid,
-                          "duration": round(time.monotonic() - t0, 3)})
+            control.send({
+                "k": "done",
+                "task": job.task,
+                "attempt": job.attempt,
+                "worker": wid,
+                "duration": round(time.monotonic() - t0, 3)
+            })
             n += 1
 
     log(f"[{name} worker {wid}] {n} tasks")
@@ -762,8 +804,9 @@ def _run_worker(name: str, pipes: Pipes, worker: Worker, threads: int) -> int:
     Worker entry point: spin `threads` independent loops and wait them out.
     Exit codes: 0 clean, 130 interrupted.
     """
-    wait_for_pipes((pipes.work, pipes.completions, pipes.results),
-                   timeout=pipes.wait)
+    wait_for_pipes(
+        (pipes.work, pipes.completions, pipes.results), timeout=pipes.wait
+    )
     base = f"{socket.gethostname()}:{os.getpid()}"
 
     def boot(i: int) -> None:
@@ -833,8 +876,9 @@ def _run_collect(results_addr: str, wait: float, output: str | None) -> int:
 _BUS_TAGS = {"work": "work", "completions": "coord", "results": "col"}
 
 
-def stop_orchestrators(procs: dict[str, subprocess.Popen[str]],
-                       grace: float = 10.0) -> None:
+def stop_orchestrators(
+        procs: dict[str, subprocess.Popen[str]], grace: float = 10.0
+    ) -> None:
     """
     SIGTERM every still-running orchestrator, then SIGKILL the stragglers.
     Idempotent and best-effort — safe from both the supervisor and teardown.
@@ -853,11 +897,12 @@ def stop_orchestrators(procs: dict[str, subprocess.Popen[str]],
             p.wait()
 
 
-def _pump(tag: str, proc: subprocess.Popen[str],
-          write_lock: threading.Lock) -> None:
+def _pump(
+        tag: str, proc: subprocess.Popen[str], write_lock: threading.Lock
+    ) -> None:
     """
-    Forward one orchestrator's stderr to our stderr, one tagged line at a
-    time. The child's stdout is not ours to touch — see the spawn site.
+    Forward one orchestrator's stderr to our stderr, one tagged line at a time.
+    The child's stdout is not ours to touch — see the spawn site.
 
     Side effects (its entire job): reads proc.stderr to EOF and writes each
     line to sys.stderr under `write_lock`, so lines from the three pumps never
@@ -873,13 +918,15 @@ def _pump(tag: str, proc: subprocess.Popen[str],
             sys.stderr.flush()
 
 
-def _bus_healthy(procs: dict[str, subprocess.Popen[str]],
-                 addrs: dict[str, str], timeout: float) -> bool:
+def _bus_healthy(
+        procs: dict[str, subprocess.Popen[str]], addrs: dict[str, str],
+        timeout: float
+    ) -> bool:
     """
     Gate on every orchestrator's healthcheck within a shared budget,
     interleaving the probe with a liveness check so a child that dies
-    immediately (bound port, bad flags) fails in ~1 s. Returns False on
-    death or timeout; the caller owns the teardown.
+    immediately (bound port, bad flags) fails in ~1 s. Returns False on death
+    or timeout; the caller owns the teardown.
     """
     deadline = time.monotonic() + timeout
     for name, addr in addrs.items():
@@ -936,8 +983,8 @@ def _run_bus(pipes: Pipes, rust_log: str, orchestrator: str) -> int:
     prefixed by a per-pipe tag ([work ] / [coord] / [col  ]). Each child's
     stdout is left inherited: the data plane passes straight through to the
     bus's own stdout, untouched and untagged, so results stay pipelineable.
-    Assumes orchestrators exit once their pipe is drained/shut down;
-    if they are run-forever servers, the bus ends only via signal.
+    Assumes orchestrators exit once their pipe is drained/shut down; if they
+    are run-forever servers, the bus ends only via signal.
 
     Side effects beyond the stated job: installs a SIGTERM handler converting
     the signal to SystemExit — a teardown path under systemd/Slurm/k8s stops,
@@ -956,8 +1003,11 @@ def _run_bus(pipes: Pipes, rust_log: str, orchestrator: str) -> int:
 
     signal.signal(signal.SIGTERM, on_sigterm)
 
-    addrs = {"work": pipes.work, "completions": pipes.completions,
-             "results": pipes.results}
+    addrs = {
+        "work": pipes.work,
+        "completions": pipes.completions,
+        "results": pipes.results
+    }
     procs: dict[str, subprocess.Popen[str]] = {}
     pumps: list[threading.Thread] = []
     write_lock = threading.Lock()
@@ -965,19 +1015,21 @@ def _run_bus(pipes: Pipes, rust_log: str, orchestrator: str) -> int:
     try:
         for name, addr in addrs.items():
             # Stream discipline across the process boundary: stderr is the
-            # diagnostic plane — ours to adopt, so PIPE it and pump it to
-            # our own stderr, tagged. stdout is the data plane — not ours
-            # to touch: left inherited (stdout=None, spelled out), the
-            # child writes straight through to whatever the bus's stdout
-            # is connected to, with no tag and no Python thread in the
-            # data path. text=True shapes only the stderr pipe we read.
-            proc = subprocess.Popen([orchestrator, addr], env=env,
-                                    stdout=None, stderr=subprocess.PIPE,
-                                    text=True)
+            # diagnostic plane — ours to adopt, so PIPE it and pump it to our
+            # own stderr, tagged. stdout is the data plane — not ours to touch:
+            # left inherited (stdout=None, spelled out), the child writes
+            # straight through to whatever the bus's stdout is connected to,
+            # with no tag and no Python thread in the data path. text=True
+            # shapes only the stderr pipe we read.
+            proc = subprocess.Popen(
+                [orchestrator, addr], env=env, stdout=None,
+                stderr=subprocess.PIPE, text=True
+            )
             procs[name] = proc
-            pump = threading.Thread(target=_pump,
-                                    args=(_BUS_TAGS[name], proc, write_lock),
-                                    daemon=True)
+            pump = threading.Thread(
+                target=_pump, args=(_BUS_TAGS[name], proc, write_lock),
+                daemon=True
+            )
             pump.start()
             pumps.append(pump)
             log(f"[bus] {name} pid={proc.pid} on {addr}")
@@ -1003,31 +1055,43 @@ def _run_bus(pipes: Pipes, rust_log: str, orchestrator: str) -> int:
 # ---------------------------------------------------------------------------
 # CLI edge — argparse lives here and in the pipeline's make_*/add_* hooks
 
-def add_pipe_args(p: argparse.ArgumentParser, defaults: Pipes,
-                  *names: str) -> None:
-    """Register --work/--completions/--results overrides (defaults from the
-    pipeline) plus the shared --wait."""
+def add_pipe_args(
+        p: argparse.ArgumentParser, defaults: Pipes, *names: str
+    ) -> None:
+    """
+    Register --work/--completions/--results overrides (defaults from the
+    pipeline) plus the shared --wait.
+    """
     for n in names:
         d = getattr(defaults, n)
-        p.add_argument(f"--{n}", default=d, metavar="HOST:PORT",
-                       help=f"{n} pipe orchestrator (default {d})")
-    p.add_argument("--wait", type=float, default=defaults.wait,
-                   help=f"seconds to wait for pipes (default {defaults.wait:g})")
+        p.add_argument(
+            f"--{n}", default=d, metavar="HOST:PORT",
+            help=f"{n} pipe orchestrator (default {d})"
+        )
+    p.add_argument(
+        "--wait", type=float, default=defaults.wait,
+        help=f"seconds to wait for pipes (default {defaults.wait:g})"
+    )
 
 
 def _add_coordinator_common(p: argparse.ArgumentParser) -> None:
     """The harness-owned coordinator policy flags."""
-    p.add_argument("--task-timeout", type=float, default=300.0,
-                   help="seconds before a task is re-dispatched (default 300)")
+    p.add_argument(
+        "--task-timeout", type=float, default=300.0,
+        help="seconds before a task is re-dispatched (default 300)"
+    )
     p.add_argument("--max-attempts", type=int, default=3)
-    p.add_argument("--in-flight", type=int, default=1000,
-                   help="feeder backpressure: max PENDING tasks; keep "
-                        "in_flight/throughput below --task-timeout "
-                        "(default 1000)")
+    p.add_argument(
+        "--in-flight", type=int, default=1000,
+        help="feeder backpressure: max PENDING tasks; keep "
+             "in_flight/throughput below --task-timeout (default 1000)"
+    )
     p.add_argument("--watchdog-tick", type=float, default=5.0)
     p.add_argument("--report-every", type=float, default=5.0)
-    p.add_argument("--hammer", type=float, default=60.0,
-                   help="seconds after drain before escalating to shutdown")
+    p.add_argument(
+        "--hammer", type=float, default=60.0,
+        help="seconds after drain before escalating to shutdown"
+    )
 
 
 def _build_parser(pipeline: Pipeline) -> argparse.ArgumentParser:
@@ -1042,21 +1106,28 @@ def _build_parser(pipeline: Pipeline) -> argparse.ArgumentParser:
     add_pipe_args(c, d, "work", "completions", "results")
 
     w = sub.add_parser("worker", help="consume tasks, do the work")
-    w.add_argument("--threads", type=int, default=4,
-                   help="independent worker loops in this process (default 4)")
+    w.add_argument(
+        "--threads", type=int, default=4,
+        help="independent worker loops in this process (default 4)"
+    )
     pipeline.add_worker_args(w)
     add_pipe_args(w, d, "work", "completions", "results")
 
     g = sub.add_parser("collect", help="drain the results pipe to JSONL")
-    g.add_argument("--output", "-o",
-                   help="file (default stdout, '-' works too)")
+    g.add_argument(
+        "--output", "-o", help="file (default stdout, '-' works too)"
+    )
     add_pipe_args(g, d, "results")
 
     b = sub.add_parser("bus", help="spawn + supervise the pipe orchestrators")
-    b.add_argument("--rust-log", default="debug",
-                   help="RUST_LOG for the orchestrators (default debug)")
-    b.add_argument("--orchestrator", default="orchestrator", metavar="BIN",
-                   help="orchestrator binary to spawn (default from PATH)")
+    b.add_argument(
+        "--rust-log", default="debug",
+        help="RUST_LOG for the orchestrators (default debug)"
+    )
+    b.add_argument(
+        "--orchestrator", default="orchestrator", metavar="BIN",
+        help="orchestrator binary to spawn (default from PATH)"
+    )
     add_pipe_args(b, d, "work", "completions", "results")
 
     return ap
@@ -1067,27 +1138,31 @@ def run(pipeline: Pipeline, argv: list[str] | None = None) -> int:
     The pipeline's single entry point. Parses the CLI and dispatches to the
     requested role. Each branch reads only the flags its own subparser
     registered — collect's parser deliberately knows just --results/--wait,
-    so Pipes is constructed per-branch, never hoisted above the dispatch
-    (a shared Pipes.from_args up here is the bug that silently asserts
-    "every subparser defines every pipe flag"). argparse.Namespace dies
-    here and in the pipeline's make_*/add_* hooks.
+    so Pipes is constructed per-branch, never hoisted above the dispatch (a
+    shared Pipes.from_args up here is the bug that silently asserts "every
+    subparser defines every pipe flag"). argparse.Namespace dies here and in
+    the pipeline's make_*/add_* hooks.
     """
     args = _build_parser(pipeline).parse_args(argv)
 
     if args.role == "coordinator":
-        return _run_coordinator(pipeline.name, Pipes.from_args(args),
-                                CoordinatorCfg.from_args(args),
-                                pipeline.make_coordinator(args))
+        return _run_coordinator(
+            pipeline.name, Pipes.from_args(args), CoordinatorCfg.from_args(args),
+            pipeline.make_coordinator(args)
+        )
 
     if args.role == "worker":
-        return _run_worker(pipeline.name, Pipes.from_args(args),
-                           pipeline.make_worker(args), args.threads)
+        return _run_worker(
+            pipeline.name, Pipes.from_args(args), pipeline.make_worker(args),
+            args.threads
+        )
 
     if args.role == "collect":
         return _run_collect(args.results, args.wait, args.output)
 
     if args.role == "bus":
-        return _run_bus(Pipes.from_args(args), args.rust_log,
-                        args.orchestrator)
+        return _run_bus(
+            Pipes.from_args(args), args.rust_log, args.orchestrator
+        )
 
     raise AssertionError(f"unhandled role {args.role!r}")  # unreachable
