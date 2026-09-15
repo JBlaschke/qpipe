@@ -109,6 +109,9 @@ jobs:
         run: pip install "maturin>=1.7,<2.0" wheel
 
       # Keep the wheel version == the release tag, so PyPI uploads can't drift.
+      # maturin reads the version from bindings/python/Cargo.toml ONLY because
+      # pyproject.toml declares `dynamic = ["version"]`; a static version there
+      # would override this sync (see the check step after the build).
       # (PyPI versions are immutable; a mismatch is painful to undo.)
       # Handles both an explicit `version = "..."` in the binding AND a workspace-
       # inherited `version.workspace = true` (in which case the source of truth is
@@ -169,6 +172,22 @@ jobs:
           --target ${{ matrix.rust_target }}
           --manifest-path bindings/python/Cargo.toml
           --out dist
+
+      # Fail fast if the built wheel is not the tag's version. Without this, a
+      # stale version would ride through to publish, where `skip-existing: true`
+      # turns "file already exists" into a green no-op (how v1.7.0 shipped nothing).
+      - name: Check wheel version == tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          shopt -s nullglob
+          all=(dist/*.whl); ok=(dist/qpipe_rs-"$VER"-*.whl)
+          if [ "${#all[@]}" -ne 1 ] || [ "${#ok[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel versioned $VER in dist/, found: ${all[*]:-none}"
+            exit 1
+          fi
+          echo "wheel version matches tag $VER: ${ok[0]}"
 
       # ---- Build the binaries that ride inside the wheel ----
       # Linux: zigbuild pins the libc floor to match the wheel tag (gnu.2.17 / musl).

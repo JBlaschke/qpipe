@@ -4,7 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "qpipe-rs"
-version = "1.6.0"
+# The version comes from bindings/python/Cargo.toml (single source of truth),
+# which the release workflow stamps with the git tag. Do NOT add a static
+# `version = "..."` here: maturin prefers it over Cargo.toml, so a stale value
+# ships silently (v1.7.0 was built as 1.6.0 that way and PyPI skipped it).
+dynamic = ["version"]
 description = "Python bindings for qpipe (MPMC work queue)"
 requires-python = ">=3.9"
 classifiers = [

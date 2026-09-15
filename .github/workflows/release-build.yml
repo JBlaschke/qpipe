@@ -328,6 +328,24 @@ jobs:
       - name: List artifacts
         run: ls -l dist/
 
+      # Last gate before PyPI: every wheel must carry the tag's version.
+      # `skip-existing: true` below would otherwise turn a stale-version build
+      # into a silent no-op (every file "already exists" -> green run, no release).
+      - name: Check all wheels match the tag version
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          shopt -s nullglob
+          wheels=(dist/*.whl); bad=0
+          [ "${#wheels[@]}" -gt 0 ] || { echo "::error::no wheels in dist/"; exit 1; }
+          for w in "${wheels[@]}"; do
+            case "${w##*/}" in
+              qpipe_rs-"$VER"-*) ;;
+              *) echo "::error::${w##*/} does not match tag version $VER"; bad=1 ;;
+            esac
+          done
+          [ "$bad" -eq 0 ] && echo "all ${#wheels[@]} wheels are version $VER"
+
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

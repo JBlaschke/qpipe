@@ -22,6 +22,8 @@ Consumer.gc_partials().
 from __future__ import annotations
 
 import json as _json
+from importlib.metadata import PackageNotFoundError as _PkgNotFound
+from importlib.metadata import version as _dist_version
 from typing import Any, Self
 
 from ._qpipe import (
@@ -38,7 +40,10 @@ __all__ = [
     "MAX_CHUNKS", "MAX_MESSAGE_SIZE", "FRAME_FLAG_CHUNK",
     "__version__",
 ]
-__version__ = "1.6.0"
+try:
+    __version__ = _dist_version("qpipe-rs")  # from the wheel metadata, never hand-bumped
+except _PkgNotFound:  # pragma: no cover - source tree without an install
+    __version__ = "0.0.0+unknown"
 
 
 # ----- codecs -----
