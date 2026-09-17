@@ -242,8 +242,10 @@ class Pipes:
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Pipes":
         """Lift the pipe addresses out of parsed args."""
-        return cls(work=args.work, completions=args.completions,
-                   results=args.results, wait=args.wait)
+        return cls(
+            work=args.work, completions=args.completions, results=args.results,
+            wait=args.wait
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,11 +266,12 @@ class CoordinatorCfg:
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "CoordinatorCfg":
         """Lift the common coordinator flags out of parsed args."""
-        return cls(task_timeout=args.task_timeout,
-                   max_attempts=args.max_attempts, in_flight=args.in_flight,
-                   watchdog_tick=args.watchdog_tick,
-                   report_every=args.report_every, hammer=args.hammer,
-                   depth_first=(args.dispatch == "depth"))
+        return cls(
+            task_timeout=args.task_timeout, max_attempts=args.max_attempts,
+            in_flight=args.in_flight, watchdog_tick=args.watchdog_tick,
+            report_every=args.report_every, hammer=args.hammer,
+            depth_first=(args.dispatch == "depth")
+        )
 
 
 # ---------------------------------------------------------------------------

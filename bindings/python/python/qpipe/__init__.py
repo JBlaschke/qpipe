@@ -10,12 +10,12 @@ actually about payload encoding.
     json     compact, newline-free JSON  (wire-compatible with consumer --jsonl)
     msgpack  one MessagePack value per frame (wire-compatible with --msgpack)
 
-Pass a name, or any object with .encode(obj)->bytes and .decode(bytes)->obj
-for a custom codec.
+Pass a name, or any object with .encode(obj)->bytes and .decode(bytes)->obj for
+a custom codec.
 
 Messages of any size: payloads larger than MAX_FRAME_SIZE are transparently
-chunked by send() and reassembled by recv(), which returns complete messages
-in completion order. Partial messages orphaned by producer failures can be
+chunked by send() and reassembled by recv(), which returns complete messages in
+completion order. Partial messages orphaned by producer failures can be
 inspected with Consumer.pending_partials() and discarded with
 Consumer.gc_partials().
 """
@@ -27,17 +27,16 @@ from importlib.metadata import version as _dist_version
 from typing import Any, Self
 
 from ._qpipe import (
-    Producer as _Producer, Consumer as _Consumer, QpipeError,
-    healthcheck, wait_until_healthy, request_drain, request_shutdown,
-    MAX_FRAME_SIZE, CHUNK_HEADER_LEN, MAX_CHUNK_PAYLOAD,
-    MAX_CHUNKS, MAX_MESSAGE_SIZE, FRAME_FLAG_CHUNK,
+    Producer as _Producer, Consumer as _Consumer, QpipeError, healthcheck,
+    wait_until_healthy, request_drain, request_shutdown, MAX_FRAME_SIZE,
+    CHUNK_HEADER_LEN, MAX_CHUNK_PAYLOAD, MAX_CHUNKS, MAX_MESSAGE_SIZE,
+    FRAME_FLAG_CHUNK,
 )
 
 __all__ = [
     "Producer", "Consumer", "QpipeError", "healthcheck", "wait_until_healthy",
-    "request_drain", "request_shutdown",
-    "MAX_FRAME_SIZE", "CHUNK_HEADER_LEN", "MAX_CHUNK_PAYLOAD",
-    "MAX_CHUNKS", "MAX_MESSAGE_SIZE", "FRAME_FLAG_CHUNK",
+    "request_drain", "request_shutdown", "MAX_FRAME_SIZE", "CHUNK_HEADER_LEN",
+    "MAX_CHUNK_PAYLOAD", "MAX_CHUNKS", "MAX_MESSAGE_SIZE", "FRAME_FLAG_CHUNK",
     "__version__",
 ]
 try:
@@ -164,19 +163,22 @@ class Consumer:
         return self._inner.recv()
 
     def gc_partials(self, idle_secs: float) -> int:
-        """Discard partial multi-frame messages that haven't received a chunk
-        for at least `idle_secs` seconds. Returns how many were discarded.
+        """
+        Discard partial multi-frame messages that haven't received a chunk for
+        at least `idle_secs` seconds. Returns how many were discarded.
 
         Partials are orphaned when a producer dies mid-message (or the
-        orchestrator expires a stale message); they cost memory until
-        dropped. Call this on whatever cadence suits your latency
-        expectations, e.g. every few hundred recvs or when the app idles.
+        orchestrator expires a stale message); they cost memory until dropped.
+        Call this on whatever cadence suits your latency expectations, e.g.
+        every few hundred recvs or when the app idles.
         """
         return self._inner.gc_partials(idle_secs)
 
     def pending_partials(self) -> tuple[int, int]:
-        """(message count, buffered bytes) of incomplete multi-frame
-        messages currently held for reassembly."""
+        """
+        (message count, buffered bytes) of incomplete multi-frame messages
+        currently held for reassembly.
+        """
         return self._inner.pending_partials()
 
     def close(self) -> None:
