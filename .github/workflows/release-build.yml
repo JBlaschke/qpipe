@@ -14,7 +14,8 @@ permissions:
   contents: write
 
 jobs:
-  # Build all PyPI wheels (with bundled binaries) via the reusable workflow.
+  # Build all PyPI wheels (two per platform — cp39-abi3 and cp315-abi3.abi3t —
+  # with bundled binaries) via the reusable workflow.
   # Their artifacts (wheel-<tag>) are visible to this run's later jobs, and the
   # PyPI publish happens inside on tag pushes — same bytes go to PyPI and tars.
   wheels:
@@ -97,6 +98,8 @@ jobs:
           # -------------------------
           # FreeBSD (built inside VM) — NOT a PyPI platform, so the wheel is
           # built in the VM and exists only in this tar (wheel_artifact empty).
+          # cp39-abi3 only: the VM builds against python3.11 and has no
+          # free-threaded 3.15, so the FreeBSD tar carries no abi3t wheel.
           # -------------------------
           - runs_on: ubuntu-24.04
             builder: freebsd-vm
@@ -273,9 +276,9 @@ jobs:
             WHEEL_DIR=wheelhouse \
               python3.11 .github/scripts/inject_bins_into_wheel.py
 
-      # Non-FreeBSD targets: take the wheel from the wheels job in this same run —
-      # identical bytes to what was published to PyPI.
-      - name: Download matching Python wheel
+      # Non-FreeBSD targets: take the wheels (cp39-abi3 + cp315-abi3.abi3t) from
+      # the wheels job in this same run — identical bytes to what went to PyPI.
+      - name: Download matching Python wheels
         if: matrix.wheel_artifact != ''
         uses: actions/download-artifact@v8
         with:

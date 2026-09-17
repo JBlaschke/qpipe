@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Inject the workspace's Rust binaries into a built wheel as scripts.
+"""Inject the workspace's Rust binaries into built wheels as scripts.
 
-Files under {name}-{version}.data/scripts/ are installed by pip/uv into the
-environment's bin/ (Scripts\\ on Windows) and made executable. Repacking with
-`python -m wheel pack` recomputes RECORD, so hashes stay valid.
+Every wheel in the wheel dir gets the same binaries: the release builds one
+wheel per stable ABI (cp39-abi3 and cp315-abi3.abi3t) from a single set of
+binaries. Files under {name}-{version}.data/scripts/ are installed by pip/uv
+into the environment's bin/ (Scripts\\ on Windows) and made executable.
+Repacking with `python -m wheel pack` recomputes RECORD, so hashes stay valid.
 """
 from __future__ import annotations
 
@@ -61,9 +63,8 @@ def main() -> None:
     args = ap.parse_args()
 
     wheels = sorted(pathlib.Path(args.wheel_dir).glob("*.whl"))
-    if len(wheels) != 1:
-        sys.exit(f"expected exactly one wheel in {args.wheel_dir}, found {len(wheels)}")
-    whl = wheels[0]
+    if not wheels:
+        sys.exit(f"no wheels found in {args.wheel_dir}")
 
     detected = detect_bin_targets(run_cargo_metadata())
     names = [x for x in re.split(r"[,\s]+", args.bin_names) if x] or detected
@@ -94,6 +95,11 @@ def main() -> None:
             "Tip: ensure the bin build step ran with --bins and the right --target."
         )
 
+    for whl in wheels:
+        inject(whl, found)
+
+
+def inject(whl: pathlib.Path, bins: dict[str, pathlib.Path]) -> None:
     work = pathlib.Path("_wheel_inject")
     if work.exists():
         shutil.rmtree(work)
@@ -103,20 +109,22 @@ def main() -> None:
     (unpacked,) = [p for p in work.iterdir() if p.is_dir()]
     scripts = unpacked / f"{unpacked.name}.data" / "scripts"  # e.g. qpipe_rs-1.4.0.data/scripts
     scripts.mkdir(parents=True, exist_ok=True)
-    for src in found.values():
+    for src in bins.values():
         shutil.copy2(src, scripts / src.name)
 
     out = pathlib.Path("_wheel_out")
     if out.exists():
         shutil.rmtree(out)
     out.mkdir()
+    # `wheel pack` rebuilds the filename from the WHEEL tags, so a multi-tag
+    # wheel (cp315-abi3.abi3t) keeps its compressed tag set.
     subprocess.check_call(
         [sys.executable, "-m", "wheel", "pack", str(unpacked), "-d", str(out)]
     )
     (new_whl,) = list(out.glob("*.whl"))
     whl.unlink()
     shutil.move(str(new_whl), whl.parent / new_whl.name)
-    print(f"injected [{', '.join(found)}] into {new_whl.name}")
+    print(f"injected [{', '.join(bins)}] into {new_whl.name}")
 
 
 if __name__ == "__main__":

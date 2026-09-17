@@ -2,22 +2,33 @@ name: Build Python wheels & publish to PyPI
 
 on:
   workflow_call: {}        # invoked by the release workflow on tag pushes
-  workflow_dispatch: {}    # standalone dry runs (build + verify, no publish)eels but do NOT publish (see `publish` job guard)
+  workflow_dispatch: {}    # standalone dry run: build + verify the wheels, no publish
+                           # (publishing lives in release-build.yml, see its `publish` job)
 
 permissions:
   contents: read
 
+# Every platform job produces TWO wheels from the same sources:
+#   qpipe_rs-<ver>-cp39-abi3-<plat>.whl          GIL-enabled CPython 3.9 .. 3.14
+#   qpipe_rs-<ver>-cp315-abi3.abi3t-<plat>.whl   CPython 3.15+, free-threaded (3.15t)
+#                                                 AND default builds alike (PEP 803)
+# bindings/python/Cargo.toml enables both `abi3-py39` and `abi3t-py315`; PyO3 picks
+# the ABI from the interpreter maturin builds against (< 3.15 -> abi3, >= 3.15 ->
+# abi3t), so each wheel is just `maturin build` with a different `--interpreter`.
+# abi3t cannot be compiled for, or loaded by, anything older than 3.15, which is
+# why the abi3 wheel stays: it is what keeps the `requires-python >= 3.9` floor.
+
 jobs:
   wheels:
-    name: Wheel ${{ matrix.wheel_tag }}
+    name: Wheels ${{ matrix.wheel_tag }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # -------- Linux glibc: ONE wheel per arch at the manylinux2014 floor (glibc 2.17).
-          # The bundled binaries are built at the SAME floor (bin_target …gnu.2.17) so the
-          # manylinux tag stays honest. These are separate from the .2.32/.2.43 binaries
-          # the release-tar workflow ships. --------
+          # -------- Linux glibc: one wheel PAIR per arch at the manylinux2014 floor
+          # (glibc 2.17). The bundled binaries are built at the SAME floor (bin_target
+          # …gnu.2.17) so the manylinux tag stays honest. These are separate from the
+          # .2.32/.2.43 binaries the release-tar workflow ships. --------
           - runs_on: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
             bin_target: x86_64-unknown-linux-gnu.2.17
@@ -78,7 +89,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Setup Python (build interpreter; abi3 floor is 3.9 regardless)
+      # Two interpreters per job, one per wheel (see the header comment). ORDER
+      # MATTERS: setup-python prepends to PATH, so the LAST one (3.12) is the
+      # `python`/`pip` every helper script and tool install below runs with; the
+      # free-threaded 3.15 is only ever addressed through its `python-path` output.
+      - name: Setup Python 3.15t (free-threaded; builds the cp315-abi3.abi3t wheel)
+        id: py315t
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.15t"
+          # 3.15 is a release candidate until the 3.15.0 final (Oct 2026). Harmless
+          # afterwards: the resolver prefers the GA build over any pre-release.
+          allow-prereleases: true
+
+      - name: Setup Python 3.12 (builds the cp39-abi3 wheel; runs the helper scripts)
+        id: py312
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -104,9 +129,12 @@ jobs:
         with:
           tool: cargo-zigbuild
 
+      # maturin >= 1.14 knows the free-threaded stable ABI (abi3t); 1.15 fixes its
+      # abi3t module-export check. Older releases don't know the ABI and would tag
+      # the 3.15 build wrongly. Keep in sync with [build-system] in pyproject.toml.
       - name: Install maturin + wheel tool
         shell: bash
-        run: pip install "maturin>=1.7,<2.0" wheel
+        run: pip install "maturin>=1.15,<2.0" wheel
 
       # Keep the wheel version == the release tag, so PyPI uploads can't drift.
       # maturin reads the version from bindings/python/Cargo.toml ONLY because
@@ -153,43 +181,90 @@ jobs:
               )
           PY
 
-      # ---- Build the abi3 extension wheel ----
-      - name: Build wheel (Linux, via zig at the chosen libc floor)
+      # ---- Build the two stable-ABI wheels: identical flags, different interpreter ----
+      # The interpreter path goes through `env` rather than inline so Windows
+      # backslash paths reach maturin untouched.
+      - name: Build wheel cp39-abi3 (Linux, via zig at the chosen libc floor)
         if: matrix.os_family == 'linux'
         shell: bash
+        env:
+          PY: ${{ steps.py312.outputs.python-path }}
         run: >
           maturin build --release --zig
           --target ${{ matrix.rust_target }}
           --compatibility ${{ matrix.compat }}
+          --interpreter "$PY"
           --manifest-path bindings/python/Cargo.toml
           --out dist
 
-      - name: Build wheel (macOS / Windows, native)
+      - name: Build wheel cp315-abi3.abi3t (Linux, via zig at the chosen libc floor)
+        if: matrix.os_family == 'linux'
+        shell: bash
+        env:
+          PY: ${{ steps.py315t.outputs.python-path }}
+        run: >
+          maturin build --release --zig
+          --target ${{ matrix.rust_target }}
+          --compatibility ${{ matrix.compat }}
+          --interpreter "$PY"
+          --manifest-path bindings/python/Cargo.toml
+          --out dist
+
+      - name: Build wheel cp39-abi3 (macOS / Windows, native)
         if: matrix.os_family != 'linux'
         shell: bash
+        env:
+          PY: ${{ steps.py312.outputs.python-path }}
         run: >
           maturin build --release
           --target ${{ matrix.rust_target }}
+          --interpreter "$PY"
           --manifest-path bindings/python/Cargo.toml
           --out dist
 
-      # Fail fast if the built wheel is not the tag's version. Without this, a
-      # stale version would ride through to publish, where `skip-existing: true`
-      # turns "file already exists" into a green no-op (how v1.7.0 shipped nothing).
-      - name: Check wheel version == tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Build wheel cp315-abi3.abi3t (macOS / Windows, native)
+        if: matrix.os_family != 'linux'
+        shell: bash
+        env:
+          PY: ${{ steps.py315t.outputs.python-path }}
+        run: >
+          maturin build --release
+          --target ${{ matrix.rust_target }}
+          --interpreter "$PY"
+          --manifest-path bindings/python/Cargo.toml
+          --out dist
+
+      # Fail fast on a wrong wheel set: exactly the two expected ABI tags (a silent
+      # fallback to a version-specific or single-ABI wheel would otherwise ship),
+      # and on release tags every wheel must carry the tag's version. Without the
+      # version check a stale version would ride through to publish, where
+      # `skip-existing: true` turns "file already exists" into a green no-op (how
+      # v1.7.0 shipped nothing).
+      - name: Check wheel set (ABI tags; version == tag on releases)
         shell: bash
         run: |
-          VER="${GITHUB_REF_NAME#v}"
           shopt -s nullglob
-          all=(dist/*.whl); ok=(dist/qpipe_rs-"$VER"-*.whl)
-          if [ "${#all[@]}" -ne 1 ] || [ "${#ok[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one wheel versioned $VER in dist/, found: ${all[*]:-none}"
+          all=(dist/*.whl)
+          abi3=(dist/qpipe_rs-*-cp39-abi3-*.whl)
+          abi3t=(dist/qpipe_rs-*-cp315-abi3.abi3t-*.whl)
+          if [ "${#all[@]}" -ne 2 ] || [ "${#abi3[@]}" -ne 1 ] || [ "${#abi3t[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one cp39-abi3 and one cp315-abi3.abi3t wheel in dist/, found: ${all[*]:-none}"
             exit 1
           fi
-          echo "wheel version matches tag $VER: ${ok[0]}"
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              VER="${GITHUB_REF_NAME#v}"
+              for w in "${all[@]}"; do
+                case "${w##*/}" in
+                  qpipe_rs-"$VER"-*) ;;
+                  *) echo "::error::${w##*/} does not match tag version $VER"; exit 1 ;;
+                esac
+              done
+              echo "both wheels are version $VER" ;;
+          esac
+          ls -l dist/
 
-      # ---- Build the binaries that ride inside the wheel ----
+      # ---- Build the binaries that ride inside the wheels ----
       # Linux: zigbuild pins the libc floor to match the wheel tag (gnu.2.17 / musl).
       - name: Build bundled binaries (Linux, zigbuild)
         if: matrix.os_family == 'linux'
@@ -201,9 +276,10 @@ jobs:
         shell: bash
         run: cargo build --release --offline --bins --target ${{ matrix.bin_target }}
 
-      # ---- Inject the binaries into the wheel's .data/scripts/ ----
-      # (installers place these on the venv PATH and mark them executable)
-      - name: Inject binaries into wheel
+      # ---- Inject the binaries into each wheel's .data/scripts/ ----
+      # (installers place these on the venv PATH and mark them executable; the
+      # script injects the same binaries into every wheel in dist/)
+      - name: Inject binaries into wheels
         shell: bash
         env:
           BIN_BUILD_TARGET: ${{ matrix.bin_target }}
@@ -213,54 +289,74 @@ jobs:
           BIN_NAMES: ${{ vars.BIN_NAMES }}
         run: python .github/scripts/inject_bins_into_wheel.py
 
-      # ---- Verify: install the injected wheel into a clean venv ----
-      # Catches the silent failure mode where a misnamed .data dir makes
-      # installers treat the binaries as package payload instead of scripts.
-      - name: Verify wheel installs with binaries (native)
+      # ---- Verify: install into a clean venv of each interpreter the wheels target ----
+      # Catches the silent failure mode where a misnamed .data dir makes installers
+      # treat the binaries as package payload instead of scripts. The checker script
+      # also asserts that the installer picked the right ABI for the interpreter,
+      # that the extension imports, and that the free-threaded interpreter is still
+      # GIL-free after the import (an extension without the free-threading
+      # declaration silently re-enables the GIL — the wheel would be pointless).
+      - name: "Verify wheels install with binaries (native: abi3 on 3.12, abi3t on 3.15t)"
         # musllinux wheels are excluded: pip refuses them on a glibc runner by
         # platform-tag rules — they get a real musl check in the Alpine step below.
         if: matrix.compat != 'musllinux_1_2'
         shell: bash
+        env:
+          PY_ABI3: ${{ steps.py312.outputs.python-path }}
+          PY_ABI3T: ${{ steps.py315t.outputs.python-path }}
+          BIN_NAMES: ${{ vars.BIN_NAMES }}
         run: |
-          python -m venv _verify
-          if [ -e _verify/Scripts/python.exe ]; then
-            PY=_verify/Scripts/python.exe; VBIN=_verify/Scripts; EXE=.exe
-          else
-            PY=_verify/bin/python; VBIN=_verify/bin; EXE=
+          set -euo pipefail
+          if command -v cygpath >/dev/null 2>&1; then   # Git Bash: make the Windows paths executable from bash
+            PY_ABI3="$(cygpath -u "$PY_ABI3")"; PY_ABI3T="$(cygpath -u "$PY_ABI3T")"
           fi
-          "$PY" -m pip install --no-index --find-links dist qpipe-rs
-          "$PY" -c "import qpipe, importlib.metadata as md; print('import OK, dist:', md.version('qpipe-rs'))"
-          if [ ! -e "$VBIN/orchestrator$EXE" ]; then
-            echo "orchestrator$EXE missing from $VBIN:"; ls -l "$VBIN"; exit 1
-          fi
-          if [ -z "$EXE" ] && [ ! -x "$VBIN/orchestrator" ]; then
-            echo "orchestrator present but not executable"; exit 1
-          fi
-          echo "venv bin contents:"; ls -l "$VBIN"
+          verify() {  # $1 = interpreter to make the venv from, $2 = venv dir, $3 = expect free-threaded (0/1)
+            "$1" -m venv "$2"
+            if [ -e "$2/Scripts/python.exe" ]; then PY="$2/Scripts/python.exe"; else PY="$2/bin/python"; fi
+            "$PY" -m pip install --no-index --find-links dist qpipe-rs
+            EXPECT_FREE_THREADED="$3" "$PY" .github/scripts/check_installed_wheel.py
+          }
+          verify "$PY_ABI3"  _verify_abi3  0
+          verify "$PY_ABI3T" _verify_abi3t 1
 
       # musllinux wheels: verify inside an actual musl platform (Alpine container).
       # This is a stronger check than the native one — the musl-linked extension
-      # really loads, and pip's tag matching runs against a genuine musl Python.
-      # The container arch matches the runner arch, which matches the wheel arch.
-      - name: Verify wheel installs with binaries (musllinux, Alpine container)
+      # really loads, and tag matching runs against genuine musl Pythons. The
+      # container arch matches the runner arch, which matches the wheel arch.
+      #   cp39-abi3        -> Alpine's own python3, installed with its pip
+      #   cp315-abi3.abi3t -> a free-threaded 3.15 from python-build-standalone,
+      #                       fetched by uv (those musl builds link musl dynamically,
+      #                       so they load extension modules).
+      # The rolling uv Alpine image is deliberate: uv embeds its Python download
+      # list, so a fresh uv is what picks up the 3.15.0 final (uv falls back to an
+      # RC only while no final release exists).
+      - name: Verify wheels install with binaries (musllinux, Alpine container)
         if: matrix.compat == 'musllinux_1_2'
         shell: bash
+        env:
+          BIN_NAMES: ${{ vars.BIN_NAMES }}
         run: |
           cat > /tmp/verify.sh <<'EOF'
-          set -e
+          set -eu
+          echo "--- cp39-abi3 on Alpine's python3 ---"
           apk add --no-cache python3 py3-pip >/dev/null
-          pip install --quiet --break-system-packages --no-index --find-links /dist qpipe-rs
-          python3 -c 'import qpipe, importlib.metadata as md; print("import OK, dist:", md.version("qpipe-rs"))'
-          BIN="$(command -v orchestrator)" || { echo "orchestrator not on PATH after install"; exit 1; }
-          test -x "$BIN"
-          echo "orchestrator at: $BIN"
+          pip install --break-system-packages --no-index --find-links /dist qpipe-rs
+          EXPECT_FREE_THREADED=0 python3 /scripts/check_installed_wheel.py
+          echo "--- cp315-abi3.abi3t on free-threaded 3.15 (python-build-standalone via uv) ---"
+          uv python install 3.15t
+          uv venv --python 3.15t /vt
+          uv pip install --python /vt/bin/python --no-index --find-links /dist qpipe-rs
+          EXPECT_FREE_THREADED=1 /vt/bin/python /scripts/check_installed_wheel.py
           EOF
           docker run --rm \
+            -e BIN_NAMES \
             -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/.github/scripts:/scripts:ro" \
             -v /tmp/verify.sh:/verify.sh:ro \
-            alpine:3.20 sh /verify.sh
+            --entrypoint sh \
+            ghcr.io/astral-sh/uv:alpine /verify.sh
 
-      - name: Show wheel
+      - name: Show wheels
         shell: bash
         run: ls -l dist/
 
