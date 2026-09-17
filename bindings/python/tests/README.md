@@ -17,6 +17,14 @@ End-to-end through the real `orchestrator` binary. Requires `maturin develop
 --uv` first and the binary on PATH (or set QPIPE_ORCHESTRATOR_BIN). Marked so
 they can be deselected.
 
+### test_work_units.py
+
+`qpipe.work` sans-I/O units: the `Ledger`'s decision algebra (register /
+dedup at either scope / complete / retry / fail, deadlines armed by `sent()`
+rather than by registration, terminal tasks leaving the ledger) and the
+coordinator's `_Outbox` (LIFO = depth-first vs FIFO = breadth-first). Time is
+passed in; every expectation is an equality on a list of Decisions. Fast tier.
+
 ### test_work.py
 
 `qpipe.work` harness (coordinator / worker roles) driven through in-process
@@ -25,7 +33,10 @@ queue whose `send()` blocks while full. Fast tier — no binary, no sockets.
 Regression for the coordinator deadlock on a beget wider than the pipes
 (blocking `work.send()` inside the completions-reading loop); fails within
 seconds with a listing of where each harness thread is parked instead of
-hanging the run.
+hanging the run. Also: the outbox peak a breadth-first vs depth-first walk
+of a binary tree makes the coordinator hold, repeated begets deduped at
+either scope, and a work pipe that dies mid-run failing its undispatched
+tasks so the run still ends.
 
 ### test_e2e_work.py
 
