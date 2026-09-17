@@ -28,12 +28,15 @@ def pipes(orchestrator_factory):
                  wait=10.0)
 
 
+@pytest.mark.parametrize("depth_first", [True, False], ids=["depth", "breadth"])
 @pytest.mark.parametrize("threads", [1, 4])
 def test_beget_wider_than_pipe_capacity_terminates(pipes, fanout_pipeline,
-                                                   run_pipeline, threads):
+                                                   run_pipeline, threads,
+                                                   depth_first):
     coordinator, worker, processed = fanout_pipeline(FANOUT)
 
-    rc = run_pipeline(pipes, coordinator, worker, threads, deadline=20.0)
+    rc = run_pipeline(pipes, coordinator, worker, threads, deadline=20.0,
+                      depth_first=depth_first)
 
     assert rc == 0
     assert len(processed) == FANOUT + 1

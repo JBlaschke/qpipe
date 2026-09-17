@@ -30,6 +30,8 @@ The contract (two structs of functions, no inheritance, state explicit)
                                                    (default: none)
     key_of(spec)            -> Hashable | None     dedup identity
                                                    (default: monotonic ids)
+    dedup                   "global" | "parent"    how long a key is kept
+                                                   (default: global — the run)
   Worker
     setup()                 -> S                   per-thread state (clients…)
     process(S, job, result, discover) -> None      do one task
@@ -69,9 +71,11 @@ Termination (one counter algebra, with the input source as the root task)
 
 Flow control (--in-flight)
   Seeds are gated: the feeder blocks once --in-flight tasks are pending, so a
-  supply-paced stream (stdin) can't out-dispatch the workers into a retry storm
-  (a task's deadline is armed at dispatch). Begets are NOT gated — they are
-  self-paced by completions.
+  supply-paced stream (stdin) can't out-dispatch the workers. Begets are NOT
+  gated — they are self-paced by completions. A task's deadline is armed when
+  the sender actually writes its frame, never at registration, so time spent
+  queued behind a full work pipe cannot masquerade as a timeout and re-queue
+  the task on top of itself.
 
   The one thing the coordinator must never do is block on the work pipe while
   it owns the completions pipe: the orchestrator's queue is bounded (10 000
@@ -82,10 +86,26 @@ Flow control (--in-flight)
   therefore go through an unbounded in-process outbox drained by a dedicated
   sender thread; the completions loop only ever blocks in recv().
 
+Dispatch order and memory (--dispatch)
+  Everything discovered but not yet dispatched waits in the coordinator's
+  outbox (the overflow beyond the work pipe's capacity), and everything
+  pending has a record in the ledger: together they are the frontier of the
+  walk, and the coordinator's memory follows it. Drained FIFO (--dispatch
+  breadth) the walk is breadth-first and the frontier is the widest level of
+  the tree — millions of directories on a large filesystem. Drained LIFO
+  (--dispatch depth, the default) it is depth-first and the frontier stays
+  near the work pipe's capacity plus workers × depth. Terminal tasks leave
+  the ledger, so per completed task the coordinator retains only its dedup
+  key, and only under Coordinator.dedup="global" — ~100 bytes for the life
+  of the run if key_of returns a digest rather than a path. Tree-shaped
+  discovery can use dedup="parent" instead: a key lives only against the
+  pending parent that begot it, and a completed task leaves nothing behind.
+
 Effect convention (the house rule)
   A side effect is legitimate only if (a) it is the function's stated job —
-  named I/O at the edge: run, push, log, *_pipes, finish, stop_orchestrators —
-  or (b) the docstring carries a "Side effects:" line saying what it buys.
+  named I/O at the edge: run, send_loop, log, *_pipes, finish,
+  stop_orchestrators — or (b) the docstring carries a "Side effects:" line
+  saying what it buys.
   The harness never imports oci (or any domain SDK): Worker.setup returns
   opaque state, so clients live entirely in your code, and collect/bus stay
   dependency-free.
@@ -97,7 +117,7 @@ from __future__ import annotations
 
 import os
 import sys
-import enum
+import math
 import time
 import signal
 import socket
@@ -160,12 +180,23 @@ class Coordinator:
     """
     The supply + branching strategy. `expand`'s default makes this a pipelining
     coordinator; override it for work-generation. `key_of`'s default gives
-    every spec a fresh id; provide it to dedup by identity.
+    every spec a fresh id; provide it to dedup by identity, at one of two
+    scopes:
+      "global"  a key is remembered for the whole run — exact for any shape
+                of discovery (DAGs, repeated seeds) at ~100-200 B per task
+                ever registered; make keys compact (a 128-bit digest beats a
+                path).
+      "parent"  a key is remembered only against the pending parent that
+                begot it and is forgotten when that parent retires — exact
+                for tree-shaped discovery (each child has one parent: a
+                filesystem walk that does not follow symlinks), and nothing
+                is retained per completed task. Seeds are not deduped.
     """
 
     seeds: Callable[[], Iterator[Spec]]
     expand: Callable[[Spec, Discovery], Iterable[Spec]] = lambda parent, d: ()
     key_of: Callable[[Spec], Hashable] | None = None
+    dedup: str = "global"
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +248,10 @@ class Pipes:
 
 @dataclass(frozen=True, slots=True)
 class CoordinatorCfg:
-    """Harness-owned coordinator policy: retries, flow control, timers."""
+    """
+    Harness-owned coordinator policy: retries, flow control, timers, and the
+    dispatch order.
+    """
 
     task_timeout: float
     max_attempts: int
@@ -225,6 +259,7 @@ class CoordinatorCfg:
     watchdog_tick: float
     report_every: float
     hammer: float
+    depth_first: bool = True    # outbox order: LIFO (depth-first) or FIFO
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "CoordinatorCfg":
@@ -232,7 +267,8 @@ class CoordinatorCfg:
         return cls(task_timeout=args.task_timeout,
                    max_attempts=args.max_attempts, in_flight=args.in_flight,
                    watchdog_tick=args.watchdog_tick,
-                   report_every=args.report_every, hammer=args.hammer)
+                   report_every=args.report_every, hammer=args.hammer,
+                   depth_first=(args.dispatch == "depth"))
 
 
 # ---------------------------------------------------------------------------
@@ -262,23 +298,23 @@ def shutdown_pipes(addrs: Sequence[str]) -> None:
 # ---------------------------------------------------------------------------
 # ledger state — generic, sans-I/O, sans-strategy
 
-class TaskState(enum.Enum):
-    """Lifecycle of a dispatched task. DONE and FAILED are terminal."""
-
-    PENDING = enum.auto()
-    DONE = enum.auto()
-    FAILED = enum.auto()
-
-
 @dataclass(slots=True)
 class _Task:
-    """One task's record. Lives inside Ledger; mutated only under its lock."""
+    """
+    One PENDING task's record. Lives inside Ledger only while the task is
+    pending — completion or terminal failure deletes it, so the ledger's
+    footprint follows the frontier of the walk, not its history (see Dispatch
+    order and memory). Mutated only under the ledger's lock.
+
+    `deadline` is +inf until the sender reports the frame written (sent()):
+    a task waiting in the outbox cannot time out.
+    """
 
     task_id: int
     spec: Spec
-    state: TaskState = TaskState.PENDING
     attempts: int = 0
-    deadline: float = 0.0
+    deadline: float = math.inf
+    children: set[Hashable] | None = None   # begotten keys (dedup="parent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,24 +374,39 @@ class Ledger:
     terminal failure -1, seal() -1 once at source exhaustion, begets are just
     more register() calls. outstanding == 0 is global done — after seal.
 
+    Holds only PENDING tasks: a task's record is deleted the moment it
+    completes or fails terminally, so late frames for it are no-ops (done,
+    error) or stale (a beget — spec_of returns None). What survives per
+    completed task is its dedup key under dedup="global", and nothing under
+    dedup="parent" (see Coordinator).
+
     Sans-I/O AND sans-strategy: frames-worth-of-data go in, frozen Decision
     values come out; it never writes a pipe, logs, or calls user code (`key_of`
     is the single closure it holds, for dedup identity only). Its lock-guarded
-    mutation is the documented exception. Time is injected, so
-    retry/timeout/termination tests are equality assertions on Decision lists.
+    mutation is the documented exception. Time is injected — sent() arms a
+    deadline, expired() sweeps against a clock — so retry/timeout/termination
+    tests are equality assertions on Decision lists.
     """
 
     def __init__(
-            self, key_of: Callable[[Spec], Hashable] | None, 
-            task_timeout: float, max_attempts: int
+            self, key_of: Callable[[Spec], Hashable] | None,
+            task_timeout: float, max_attempts: int, dedup: str = "global"
         ) -> None:
-        """Set dedup identity and policy; outstanding starts at 1 (source)."""
+        """
+        Set dedup identity + scope and policy; outstanding starts at 1
+        (source). `dedup` is "global" or "parent" (see Coordinator).
+        """
+        if dedup not in ("global", "parent"):
+            raise ValueError(
+                f"dedup must be 'global' or 'parent', got {dedup!r}")
         self._lock = threading.Lock()
         self._key_of = key_of
-        self._tasks: dict[int, _Task] = {}
-        self._seen: dict[Hashable, int] = {}   # key -> task id, if key_of
+        self._dedup = dedup
+        self._tasks: dict[int, _Task] = {}     # PENDING tasks only
+        self._seen: set[Hashable] = set()       # run-wide keys (dedup="global")
         self._next = 0
-        self._outstanding = 1                  # the source token
+        self._registered = 0
+        self._outstanding = 1                   # the source token
         self._sealed = False
         self._done = 0
         self._failed: list[tuple[int, Spec]] = []
@@ -364,25 +415,38 @@ class Ledger:
 
     # -- public protocol -----------------------------------------------------
 
-    def register(self, spec: Spec, now: float) -> list[Decision]:
+    def register(
+            self, spec: Spec, parent: int | None = None
+        ) -> list[Decision]:
         """
-        Register one spec (a seed or a begotten child); returns the Send to
-        apply, or [] if key_of dedups it against a known task.
+        Register one spec — a seed (no parent) or a child begotten by the
+        pending task `parent`; returns the Send to apply, or [] if key_of
+        dedups it: against every key of the run (dedup="global"), or against
+        what `parent` has already begotten (dedup="parent" — seeds, and
+        children of a parent that has since retired, are not deduped).
         """
         with self._lock:
-            if self._key_of is not None:
-                key = self._key_of(spec)
-                if key in self._seen:
-                    return []
+            if self._key_of is not None and self._is_dup(spec, parent):
+                return []
             self._next += 1
             tid = self._next
             task = _Task(task_id=tid, spec=spec)
             self._tasks[tid] = task
-            if self._key_of is not None:
-                self._seen[self._key_of(spec)] = tid
+            self._registered += 1
             self._outstanding += 1
-            self._stamp(task, now)
+            self._stamp(task)
             return [Send(task=tid, attempt=task.attempts, spec=spec)]
+
+    def sent(self, task_id: int, attempt: int, now: float) -> None:
+        """
+        The sender wrote this attempt's frame: arm its re-dispatch deadline.
+        No-op for a task no longer pending, or for a stale attempt (a later
+        one was already decided) — there is nothing left to arm.
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.attempts == attempt:
+                task.deadline = now + self._task_timeout
 
     def seal(self) -> None:
         """
@@ -395,7 +459,8 @@ class Ledger:
 
     def spec_of(self, task_id: int) -> Spec | None:
         """
-        The spec of a known task, or None — used to expand a beget's parent.
+        The spec of a PENDING task, or None — used to expand a beget's
+        parent; None makes a beget for an already-retired task stale.
         """
         with self._lock:
             task = self._tasks.get(task_id)
@@ -403,38 +468,40 @@ class Ledger:
 
     def complete(self, task_id: int) -> list[Decision]:
         """
-        Retire a task on its `done` frame (no new work). Late/dup no-op.
+        Retire a task on its `done` frame (no new work) and forget it.
+        Late/dup no-op.
         """
         with self._lock:
-            task = self._tasks.get(task_id)
-            if task is not None and task.state is TaskState.PENDING:
-                task.state = TaskState.DONE
+            if self._tasks.pop(task_id, None) is not None:
                 self._outstanding -= 1
                 self._done += 1
             return []
 
     def fail_or_retry(
-            self, task_id: int, why: str, now: float, *, permanent: bool
+            self, task_id: int, why: str, *, permanent: bool
         ) -> list[Decision]:
         """
         Apply an `error` frame: one Retry, or one Failed. Late/dup no-op.
         """
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or task.state is not TaskState.PENDING:
+            if task is None:
                 return []
-            return self._retry_or_fail(task, why, now, permanent=permanent)
+            return self._retry_or_fail(task, why, permanent=permanent)
 
     def expired(self, now: float) -> list[Decision]:
-        """Sweep overdue PENDING tasks; return Retry/Failed decisions."""
-        decisions: list[Decision] = []
+        """
+        Sweep overdue tasks; return Retry/Failed decisions. Only a task whose
+        frame was actually sent has a finite deadline, so time spent queued
+        in the outbox never counts.
+        """
         with self._lock:
-            for task in self._tasks.values():
-                if task.state is TaskState.PENDING and now > task.deadline:
-                    decisions.extend(
-                        self._retry_or_fail(task, "timeout", now,
-                                            permanent=False))
-        return decisions
+            overdue = [t for t in self._tasks.values() if now > t.deadline]
+            decisions: list[Decision] = []
+            for task in overdue:                # may delete from _tasks
+                decisions.extend(
+                    self._retry_or_fail(task, "timeout", permanent=False))
+            return decisions
 
     def pending(self) -> int:
         """
@@ -454,23 +521,41 @@ class Ledger:
         """Consistent snapshot for reporting and the final summary."""
         with self._lock:
             return Stats(
-                outstanding=self._outstanding, tasks=len(self._tasks),
+                outstanding=self._outstanding, tasks=self._registered,
                 done=self._done, failed=tuple(self._failed),
                 sealed=self._sealed
             )
 
     # -- internals (call only with self._lock held) ---------------------------
 
+    def _is_dup(self, spec: Spec, parent: int | None) -> bool:
+        """Consult, and update, the key set in scope; True if seen before."""
+        assert self._key_of is not None
+        key = self._key_of(spec)
+        if self._dedup == "global":
+            seen = self._seen
+        else:
+            owner = self._tasks.get(parent) if parent is not None else None
+            if owner is None:
+                return False                # seed, or parent already retired
+            if owner.children is None:
+                owner.children = set()
+            seen = owner.children
+        if key in seen:
+            return True
+        seen.add(key)
+        return False
+
     def _retry_or_fail(
-            self, task: _Task, why: str, now: float, *, permanent: bool
+            self, task: _Task, why: str, *, permanent: bool
         ) -> list[Decision]:
         """Decide: another attempt (Retry) or terminal failure (Failed)."""
         if not permanent and task.attempts < self._max_attempts:
-            self._stamp(task, now)
+            self._stamp(task)
             return [Retry(task=task.task_id, attempt=task.attempts,
                           spec=task.spec, why=why)]
 
-        task.state = TaskState.FAILED
+        del self._tasks[task.task_id]
         self._outstanding -= 1
         self._failed.append((task.task_id, task.spec))
         return [
@@ -480,16 +565,66 @@ class Ledger:
             )
         ]
 
-    def _stamp(self, task: _Task, now: float) -> None:
+    def _stamp(self, task: _Task) -> None:
         """
-        Account for one send: bump attempts, arm the re-dispatch deadline.
+        Account for one dispatch decision: bump attempts and disarm the
+        deadline until sent() reports the frame written.
         """
         task.attempts += 1
-        task.deadline = now + self._task_timeout
+        task.deadline = math.inf
 
 
 # ---------------------------------------------------------------------------
 # coordinator — stateless wiring around the ledger and the strategy
+
+class _Outbox:
+    """
+    The coordinator's unbounded in-process queue of work frames, drained by
+    the sender thread (see Flow control). Its order IS the dispatch policy:
+    LIFO makes the walk depth-first, FIFO breadth-first (see Dispatch order
+    and memory). `peak` records the deepest it ever got — the frontier the
+    run had to hold in memory beyond the work pipe.
+    """
+
+    def __init__(self, depth_first: bool) -> None:
+        self._items: deque[tuple[int, int, Spec]] = deque()
+        self._cv = threading.Condition()
+        self._closed = False
+        self._depth_first = depth_first
+        self.peak = 0
+
+    def __len__(self) -> int:
+        with self._cv:
+            return len(self._items)
+
+    def push(self, task: int, attempt: int, spec: Spec) -> None:
+        """Queue one frame. Never blocks: the outbox is unbounded."""
+        with self._cv:
+            self._items.append((task, attempt, spec))
+            if len(self._items) > self.peak:
+                self.peak = len(self._items)
+            self._cv.notify()
+
+    def pop(self) -> tuple[int, int, Spec] | None:
+        """
+        The next frame per the dispatch policy; blocks while empty. None
+        once closed AND empty — the sender's signal to stop.
+        """
+        with self._cv:
+            while not self._items and not self._closed:
+                self._cv.wait()
+            if not self._items:
+                return None
+            if self._depth_first:
+                return self._items.pop()
+            return self._items.popleft()
+
+    def close(self) -> None:
+        """No more frames will matter: let pop() return None once empty."""
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
 
 def _coordinator_watchdog(
         *, name: str, ledger: Ledger, apply: Callable[[Decision], None],
@@ -521,10 +656,13 @@ def _coordinator_watchdog(
         shutdown_pipes((pipes.work, pipes.completions))
 
 
-def _summarize(name: str, stats: Stats, elapsed: float) -> int:
+def _summarize(
+        name: str, stats: Stats, elapsed: float, outbox_peak: int
+    ) -> int:
     """Final log lines + exit code: 1 if anything failed or never finished."""
     log(f"[{name}] done: {stats.tasks} tasks, {stats.done} completed, "
-        f"{len(stats.failed)} failed, {elapsed:.1f}s")
+        f"{len(stats.failed)} failed, outbox peak {outbox_peak}, "
+        f"{elapsed:.1f}s")
 
     if stats.outstanding > 0:
         pending = stats.outstanding - (0 if stats.sealed else 1)
@@ -559,7 +697,7 @@ def _run_coordinator(
 
     ledger = Ledger(
         key_of=coordinator.key_of, task_timeout=cfg.task_timeout,
-        max_attempts=cfg.max_attempts
+        max_attempts=cfg.max_attempts, dedup=coordinator.dedup
     )
 
     t0 = time.monotonic()
@@ -567,56 +705,56 @@ def _run_coordinator(
     loop_done = threading.Event()
     finishing = threading.Event()
     finish_lock = threading.Lock()
-    outbox: deque[tuple[int, int, Spec]] = deque()
-    outbox_cv = threading.Condition()
+    outbox = _Outbox(depth_first=cfg.depth_first)
 
     with qpipe.Producer.connect(pipes.work, codec="json") as work, \
          qpipe.Consumer.connect(pipes.completions, codec="json") as control:
 
-        def push(task: int, attempt: int, spec: Spec) -> None:
-            """
-            Queue one work frame for the sender thread. Never blocks: the
-            outbox is unbounded, so a beget wider than the orchestrator's queue
-            cannot stall the completions loop (see Flow control).
-            """
-            with outbox_cv:
-                outbox.append((task, attempt, spec))
-                outbox_cv.notify()
-
         def send_loop() -> None:
             """
-            The one effect on the work pipe. Drains the outbox in order; the
-            blocking work.send() (a full orchestrator queue withholds its ACK)
-            is confined here, where blocking is harmless. Ends on loop_done
-            once the outbox is empty; a dying pipe ends it early.
+            The one effect on the work pipe. Drains the outbox in dispatch
+            order; the blocking work.send() (a full orchestrator queue
+            withholds its ACK) is confined here, where blocking is harmless,
+            and a frame's deadline is armed only once its send has returned.
+            Ends when the outbox is closed and empty. Should the pipe die,
+            every frame from then on is failed terminally instead of sent: an
+            unsent task has no deadline, so nothing else would ever retire
+            it, and the run still has to reach outstanding == 0 to end.
             """
-            while True:
-                with outbox_cv:
-                    while not outbox and not loop_done.is_set():
-                        outbox_cv.wait(0.5)
-                    if not outbox:
-                        return              # loop_done and nothing left
-                    task, attempt, spec = outbox.popleft()
-                try:
-                    work.send({"task": task, "attempt": attempt, "spec": spec})
-                except Exception as e:  # noqa: BLE001 — pipe going away
-                    log(f"[{name}] work pipe send failed: {e}")
-                    return
+            dead: str | None = None
+            failed = 0
+            while (item := outbox.pop()) is not None:
+                task, attempt, spec = item
+                if dead is None:
+                    try:
+                        work.send(
+                            {"task": task, "attempt": attempt, "spec": spec})
+                    except Exception as e:  # noqa: BLE001 — pipe going away
+                        dead = f"work pipe send failed: {e}"
+                        log(f"[{name}] {dead} — failing every task still to "
+                            f"be dispatched")
+                    else:
+                        ledger.sent(task, attempt, time.monotonic())
+                        continue
+                ledger.fail_or_retry(task, dead, permanent=True)
+                failed += 1
+            if failed:
+                log(f"[{name}] {failed} tasks failed undispatched")
 
         def apply(decision: Decision) -> None:
             """Interpret one ledger Decision — the algebra's only consumer."""
             match decision:
                 case Send(task=task, attempt=attempt, spec=spec):
-                    push(task, attempt, spec)
+                    outbox.push(task, attempt, spec)
                 case Retry(task=task, attempt=attempt, spec=spec, why=why):
                     log(f"[{name}] retry {attempt}/{cfg.max_attempts} "
                         f"task {task} ({_short(spec)}): {why}")
-                    push(task, attempt, spec)
+                    outbox.push(task, attempt, spec)
                 case Failed(task=task, attempts=attempts, spec=spec, why=why):
                     log(f"[{name}] FAILED task {task} after {attempts} "
                         f"attempts: {why} — {_short(spec)}")
 
-        def handle(msg: dict[str, Any], now: float) -> list[Decision]:
+        def handle(msg: dict[str, Any]) -> list[Decision]:
             """
             Turn one completions-pipe frame into Decisions (calls the
             strategy's expand for begets).
@@ -626,15 +764,16 @@ def _run_coordinator(
                 return ledger.complete(msg.get("task"))
             if kind == "error":
                 return ledger.fail_or_retry(
-                    msg.get("task"), str(msg.get("why", "")), now,
+                    msg.get("task"), str(msg.get("why", "")),
                     permanent=bool(msg.get("permanent")))
             if kind == "beget":
-                parent = ledger.spec_of(msg.get("task"))
+                parent_id = msg.get("task")
+                parent = ledger.spec_of(parent_id)
                 if parent is None:
-                    return []           # stale beget for an unknown task
+                    return []           # stale beget: parent already retired
                 decisions: list[Decision] = []
                 for child in coordinator.expand(parent, msg.get("spec") or {}):
-                    decisions.extend(ledger.register(child, now))
+                    decisions.extend(ledger.register(child, parent=parent_id))
                 return decisions
             return []
 
@@ -667,7 +806,8 @@ def _run_coordinator(
             s = ledger.stats()
             el = max(now - t0, 1e-9)
             log(f"[{name}] outstanding={s.outstanding} tasks={s.tasks} "
-                f"done={s.done} source={'sealed' if s.sealed else 'open'} "
+                f"done={s.done} outbox={len(outbox)} "
+                f"source={'sealed' if s.sealed else 'open'} "
                 f"({s.done / el:.0f}/s, {el:.0f}s)")
 
         def feed() -> None:
@@ -686,7 +826,7 @@ def _run_coordinator(
                 for spec in coordinator.seeds():
                     while ledger.pending() >= cfg.in_flight:
                         time.sleep(0.05)        # backpressure — see docstring
-                    for decision in ledger.register(spec, time.monotonic()):
+                    for decision in ledger.register(spec):
                         apply(decision)
                     n += 1
             except Exception as e:  # noqa: BLE001 — pipes/source dying
@@ -715,7 +855,7 @@ def _run_coordinator(
             watchdog.start()
 
             for msg in control:     # EOFs only once drained or shut down
-                for decision in handle(msg, now=time.monotonic()):
+                for decision in handle(msg):
                     apply(decision)
                 maybe_report()
                 if ledger.done():
@@ -729,12 +869,14 @@ def _run_coordinator(
 
         finally:
             loop_done.set()
-            with outbox_cv:
-                outbox_cv.notify_all()
+            outbox.close()
             sender.join(timeout=5.0)    # flush stragglers before the drain
 
     finish()                        # no-op if the watchdog beat us to it
-    return _summarize(name, ledger.stats(), elapsed=time.monotonic() - t0)
+    return _summarize(
+        name, ledger.stats(), elapsed=time.monotonic() - t0,
+        outbox_peak=outbox.peak
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1233,12 @@ def _add_coordinator_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--hammer", type=float, default=60.0,
         help="seconds after drain before escalating to shutdown"
+    )
+    p.add_argument(
+        "--dispatch", choices=("depth", "breadth"), default="depth",
+        help="outbox order: depth (LIFO; bounds the frontier of a "
+             "work-generating walk) or breadth (FIFO; input order) "
+             "(default depth)"
     )
 
 

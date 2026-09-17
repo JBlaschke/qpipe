@@ -142,8 +142,9 @@ def fanout_pipeline():
 @pytest.fixture
 def run_pipeline():
     """
-    Driver: run(pipes, coordinator, worker, threads, deadline) -> coordinator
-    rc. Runs the real _run_worker and _run_coordinator in daemon threads. If
+    Driver: run(pipes, coordinator, worker, threads, deadline, *,
+    depth_first=True) -> coordinator rc. Runs the real _run_worker and
+    _run_coordinator in daemon threads. If
     the coordinator has not returned within `deadline` seconds the test FAILS
     (instead of hanging the run) with the innermost frames of every live
     harness thread — a deadlock shows up as the coordinator parked in
@@ -164,10 +165,12 @@ def run_pipeline():
                              f"{fr.lineno} in {fr.name}")
         return "\n".join(lines)
 
-    def run(pipes, coordinator, worker, threads, deadline):
+    def run(pipes, coordinator, worker, threads, deadline, *,
+            depth_first=True):
         cfg = CoordinatorCfg(task_timeout=300.0, max_attempts=3,
                              in_flight=1000, watchdog_tick=0.2,
-                             report_every=1e9, hammer=5.0)
+                             report_every=1e9, hammer=5.0,
+                             depth_first=depth_first)
         outcome = []
 
         def coordinate():
