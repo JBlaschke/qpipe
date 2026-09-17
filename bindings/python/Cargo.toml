@@ -8,7 +8,7 @@ name = "_qpipe"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["abi3-py39"] }   # NOT extension-module here
+pyo3 = { version = "0.29", features = ["abi3-py39", "abi3t-py315"] }   # NOT extension-module here
 qpipe = { path = "../.." }                              # in-repo, no git tag needed
 
 [features]

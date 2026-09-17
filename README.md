@@ -272,8 +272,12 @@ Re-run `uv run maturin develop --uv` after editing the Rust
 (`bindings/python/src/lib.rs`). Edits to the pure-Python layer
 (`python/qpipe/__init__.py`) are picked up without a rebuild.
 
-> Release wheels are `abi3` (one wheel per platform, covering CPython ≥ 3.9)
-> and are built in CI; see `.github/workflows/`.
+> Release wheels are stable-ABI builds, two per platform, built in CI (see
+> `.github/workflows/`): `cp39-abi3` for GIL-enabled CPython 3.9–3.14, and
+> `cp315-abi3.abi3t` for CPython 3.15+ — the free-threaded `3.15t` build and
+> the default build alike (PEP 803). pip/uv pick the right one. Both are
+> needed because `abi3t` cannot be built for, or loaded by, anything older
+> than 3.15.
 
 ### Running the Rust tests
 
