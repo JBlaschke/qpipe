@@ -21,9 +21,10 @@ they can be deselected.
 
 `qpipe.work` sans-I/O units: the `Ledger`'s decision algebra (register /
 dedup at either scope / complete / retry / fail, deadlines armed by `sent()`
-rather than by registration, terminal tasks leaving the ledger) and the
-coordinator's `_Outbox` (LIFO = depth-first vs FIFO = breadth-first). Time is
-passed in; every expectation is an equality on a list of Decisions. Fast tier.
+rather than by registration, terminal tasks leaving the ledger, a parked
+beget's `Defer` token and shared dedup scope) and the coordinator's `_Outbox`
+(LIFO = depth-first vs FIFO = breadth-first). Time is passed in; every
+expectation is an equality on a list of Decisions. Fast tier.
 
 ### test_work.py
 
@@ -35,8 +36,9 @@ Regression for the coordinator deadlock on a beget wider than the pipes
 seconds with a listing of where each harness thread is parked instead of
 hanging the run. Also: the outbox peak a breadth-first vs depth-first walk
 of a binary tree makes the coordinator hold, repeated begets deduped at
-either scope, and a work pipe that dies mid-run failing its undispatched
-tasks so the run still ends.
+either scope, a 5000-child beget parked as one outbox entry, an `expand()`
+that raises mid-beget, and a work pipe that dies mid-run failing its
+undispatched tasks so the run still ends.
 
 ### test_e2e_work.py
 

@@ -9,7 +9,7 @@ is an equality on a list of Decisions.
 """
 
 import pytest
-from qpipe.work import Failed, Ledger, Retry, Send, _Outbox
+from qpipe.work import Defer, Failed, Ledger, Retry, Send, _Outbox
 
 T = 10.0    # task timeout used throughout
 
@@ -60,36 +60,69 @@ def test_dedup_key_survives_completion():
     assert L.stats().tasks == 1
 
 
-def test_parent_scoped_dedup_forgets_with_the_parent():
-    """dedup="parent": a key is checked only against what its pending parent
-    already begot; the parent's retirement takes the keys with it, and the
-    ledger keeps no run-wide set at all."""
+def test_parent_scoped_dedup_lives_with_the_begets():
+    """dedup="parent": a child is checked only against the scope of the
+    parent that begot it. The scope is shared between the parent's record
+    and its parked begets, so it outlives the parent's retirement while a
+    beget is still expanding, and the ledger keeps no run-wide set at all."""
     L = ledger(key_of=lambda s: s["path"], dedup="parent")
     root = {"path": "/"}
     assert L.register(root) == [Send(task=1, attempt=1, spec=root)]
+    disc = {"children": ["/a", "/b"]}
+    [d1] = L.defer(1, disc)
+    assert d1 == Defer(task=1, spec=root, disc=disc, scope=set())
+    [d2] = L.defer(1, disc)                     # a retry's duplicate beget
+    assert d2.scope is d1.scope                 # one scope object per parent
+
     a = {"path": "/a"}
-    assert L.register(a, parent=1) == [Send(task=2, attempt=1, spec=a)]
-    assert L.register({"path": "/a"}, parent=1) == []   # re-begotten by a retry
+    assert L.register(a, scope=d1.scope) == [Send(task=2, attempt=1, spec=a)]
+    assert L.register({"path": "/a"}, scope=d2.scope) == []    # across begets
+    L.complete(1)                               # root retires, begets parked
     b = {"path": "/b"}
-    assert L.register(b, parent=1) == [Send(task=3, attempt=1, spec=b)]
-    assert L.register({"path": "/a"}, parent=2) == \
-        [Send(task=4, attempt=1, spec={"path": "/a"})]  # other parent's scope
+    assert L.register(b, scope=d1.scope) == [Send(task=3, attempt=1, spec=b)]
+    # scope outlived it
+    assert L.register({"path": "/b"}, scope=d2.scope) == []
+    # a seed: no scope
     assert L.register({"path": "/a"}) == \
-        [Send(task=5, attempt=1, spec={"path": "/a"})]  # seeds: never deduped
-    L.complete(1)                       # root retires: its keys go with it
-    assert L.register({"path": "/b"}, parent=1) == \
-        [Send(task=6, attempt=1, spec={"path": "/b"})]  # parent gone: no scope
-    assert not L._seen                                      # nothing run-wide
-    assert L.stats().tasks == 6
+        [Send(task=4, attempt=1, spec={"path": "/a"})]
+    assert L.register({"path": "/a"}, scope=set()) == \
+        [Send(task=5, attempt=1, spec={"path": "/a"})]         # another parent
+    # nothing run-wide
+    assert not L._seen
+    assert L.stats().tasks == 5
 
 
-def test_global_dedup_ignores_the_parent():
-    L = ledger(key_of=lambda s: s["path"])                  # dedup="global"
+def test_global_dedup_ignores_the_scope():
+    L = ledger(key_of=lambda s: s["path"])                     # dedup="global"
     L.register({"path": "/"})
+    [d] = L.defer(1, {})
+    # no per-parent sets
+    assert d.scope is None
     a = {"path": "/a"}
-    assert L.register(a, parent=1) == [Send(task=2, attempt=1, spec=a)]
-    assert L.register({"path": "/a"}, parent=2) == []
+    assert L.register(a, scope=set()) == [Send(task=2, attempt=1, spec=a)]
+    assert L.register({"path": "/a"}, scope=set()) == []
     assert L.register({"path": "/a"}) == []
+
+
+def test_parked_beget_holds_a_token_until_released():
+    L = ledger()
+    L.register({"n": 1})
+    # stale: unknown parent
+    assert L.defer(99, {}) == []
+    [d] = L.defer(1, {"children": [2, 3]})
+    assert d == Defer(task=1, spec={"n": 1}, disc={"children": [2, 3]},
+                      scope=None)
+    s = L.stats()
+    assert (s.outstanding, s.deferred, L.pending()) == (3, 1, 2)
+    L.complete(1)
+    L.seal()
+    assert not L.done()                         # the parked beget holds a token
+    L.register({"n": 2}, scope=d.scope)         # one child drawn from it...
+    L.release()                                 # ...and it is exhausted
+    # child 2 pending
+    assert (L.stats().deferred, L.done()) == (0, False)
+    L.complete(2)
+    assert L.done()
 
 
 def test_dedup_scope_is_validated():
@@ -187,7 +220,7 @@ def test_error_frames_retry_then_fail():
 def test_outbox_order_and_peak(depth_first, expected):
     ob = _Outbox(depth_first=depth_first)
     for t in (1, 2, 3):
-        ob.push(t, 1, {"t": t})
+        ob.push((t, 1, {"t": t}))
     assert len(ob) == 3 and ob.peak == 3
     assert [ob.pop()[0] for _ in range(3)] == expected
     assert len(ob) == 0 and ob.peak == 3
@@ -197,8 +230,8 @@ def test_outbox_order_and_peak(depth_first, expected):
 
 def test_closed_outbox_still_serves_what_is_queued():
     ob = _Outbox(depth_first=True)
-    ob.push(1, 1, {})
-    ob.push(2, 1, {})
+    ob.push((1, 1, {}))
+    ob.push((2, 1, {}))
     ob.close()
     assert ob.pop() == (2, 1, {})
     assert ob.pop() == (1, 1, {})

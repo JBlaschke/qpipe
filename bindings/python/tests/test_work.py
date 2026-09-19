@@ -208,15 +208,16 @@ def binary_tree_pipeline(depth, dedup="global", begets=1):
 
 
 @pytest.mark.parametrize("depth_first, lo, hi",
-                         [(True, 0, 200), (False, 600, 10 ** 9)],
+                         [(True, 0, 150), (False, 300, 10 ** 9)],
                          ids=["depth", "breadth"])
 def test_dispatch_order_sets_the_outbox_peak(fake_pipes, run_pipeline, capsys,
                                              depth_first, lo, hi):
     """
     A complete binary tree of depth 10 (2047 directories) through an
     8-frame work pipe with one worker. Breadth-first parks most of the
-    widest level (1024 leaves) in the coordinator's outbox; depth-first
-    keeps it to a few dozen. Both walk every directory exactly once.
+    widest level in the coordinator's outbox — one parked beget per parent
+    at the level above, ~600 entries; depth-first keeps it to a few dozen.
+    Both walk every directory exactly once.
     """
     pipes = Pipes(work=fake_pipes(8), completions=fake_pipes(CAPACITY),
                   results=fake_pipes(CAPACITY), wait=1.0)
@@ -275,8 +276,9 @@ def test_dead_work_pipe_fails_undispatched_tasks(fake_pipes, fanout_pipeline,
     """
     The work pipe dies after delivering the seed. Its 10 children can never
     be dispatched, and an undispatched task has no deadline, so the sender
-    must fail them terminally for outstanding to reach zero: the run ends
-    partial (rc 1) instead of hanging.
+    must fail the one child it had drawn terminally and drop the parked
+    beget for outstanding to reach zero: the run ends partial (rc 1)
+    instead of hanging.
     """
     pipes = Pipes(work=fake_pipes(CAPACITY, cls=DyingPipe),
                   completions=fake_pipes(CAPACITY),
@@ -289,4 +291,63 @@ def test_dead_work_pipe_fails_undispatched_tasks(fake_pipes, fanout_pipeline,
     assert processed == [1]                     # the seed, nothing else
     err = capsys.readouterr().err
     assert "work pipe send failed" in err
-    assert "11 tasks, 1 completed, 10 failed" in err
+    assert "2 tasks, 1 completed, 1 failed" in err     # seed + the drawn child
+    assert "1 begets dropped unexpanded" in err
+
+
+# ---------------------------------------------------------------------------
+# parked begets: a wide discovery costs the outbox one entry, not one per child
+
+def test_parked_begets_keep_the_outbox_flat(fake_pipes, fanout_pipeline,
+                                            run_pipeline, capsys):
+    """
+    One beget of 5000 children through an 8-frame work pipe, one worker.
+    The outbox holds the parked beget rather than 5000 frames, so its peak
+    stays in single digits while every child is still walked exactly once.
+    """
+    pipes = Pipes(work=fake_pipes(8), completions=fake_pipes(CAPACITY),
+                  results=fake_pipes(CAPACITY), wait=1.0)
+    coordinator, worker, processed = fanout_pipeline(5000)
+
+    rc = run_pipeline(pipes, coordinator, worker, 1, deadline=60.0)
+
+    assert rc == 0
+    assert len(processed) == 5001
+    m = re.search(r"outbox peak (\d+)", capsys.readouterr().err)
+    assert m and int(m.group(1)) < 10, m.group(0)
+
+
+def test_expand_failure_drops_the_rest_of_that_beget(fake_pipes, run_pipeline,
+                                                     capsys):
+    """
+    expand() raising mid-beget must not hang the run: the children drawn so
+    far are walked, the rest of that beget is dropped, and the run ends
+    rc 1 saying so.
+    """
+    processed = []
+
+    def seeds():
+        yield {"id": 0}
+
+    def expand(parent, disc):
+        for c in disc["children"]:
+            if c == 3:
+                raise ValueError("bad child")
+            yield {"id": c}
+
+    def process(_state, job, result, discover):
+        if job.spec["id"] == 0:
+            discover({"children": [1, 2, 3, 4, 5]})
+        processed.append(job.spec["id"])
+
+    pipes = Pipes(work=fake_pipes(CAPACITY), completions=fake_pipes(CAPACITY),
+                  results=fake_pipes(CAPACITY), wait=1.0)
+    rc = run_pipeline(pipes, Coordinator(seeds=seeds, expand=expand),
+                      Worker(setup=lambda: None, process=process), 1,
+                      deadline=10.0)
+
+    assert rc == 1
+    assert sorted(processed) == [0, 1, 2]
+    err = capsys.readouterr().err
+    assert "expand() failed for task 1" in err
+    assert "1 begets could not be expanded" in err
