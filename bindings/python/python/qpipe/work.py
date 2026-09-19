@@ -27,7 +27,9 @@ The contract (two structs of functions, no inheritance, state explicit)
   Coordinator
     seeds()                 -> Iterator[Spec]      the inputs
     expand(parent, disc)    -> Iterable[Spec]      discovery -> new specs
-                                                   (default: none)
+                                                   (default: none; drawn
+                                                   lazily, one child per
+                                                   dispatch)
     key_of(spec)            -> Hashable | None     dedup identity
                                                    (default: monotonic ids)
     dedup                   "global" | "parent"    how long a key is kept
@@ -64,10 +66,12 @@ What the harness guarantees so your worker can't get it wrong
 
 Termination (one counter algebra, with the input source as the root task)
   outstanding starts at 1 — the source token. Each registered spec +1, each
-  completion or terminal failure -1, source exhaustion seals the token (-1),
-  each beget +1. outstanding == 0 therefore means the source is sealed AND
-  every task is terminal — for both patterns, and nothing can hit zero before
-  seal, so coordinator thread start order is a don't-care.
+  completion or terminal failure -1, source exhaustion seals the token (-1).
+  A beget holds a token of its own (+1) from arrival until its last child has
+  been registered (-1), so children still parked unexpanded can never let
+  the count reach zero. outstanding == 0 therefore means the source is
+  sealed AND every task is terminal — for both patterns, and nothing can hit
+  zero before seal, so coordinator thread start order is a don't-care.
 
 Flow control (--in-flight)
   Seeds are gated: the feeder blocks once --in-flight tasks are pending, so a
@@ -98,8 +102,14 @@ Dispatch order and memory (--dispatch)
   the ledger, so per completed task the coordinator retains only its dedup
   key, and only under Coordinator.dedup="global" — ~100 bytes for the life
   of the run if key_of returns a digest rather than a path. Tree-shaped
-  discovery can use dedup="parent" instead: a key lives only against the
-  pending parent that begot it, and a completed task leaves nothing behind.
+  discovery can use dedup="parent" instead: a key lives only in the scope of
+  the parent that begot it, and a completed task leaves nothing behind.
+  A beget is parked in the outbox as received — the parent's spec, the
+  discovery dict, the parent's dedup scope — and expanded one child per
+  dispatch by the sender, which puts it back beneath whatever the workers
+  have discovered meanwhile. A directory with a million subdirectories thus
+  costs the coordinator the names it was sent, not a million specs at once;
+  the stat line's deferred= counts the begets still parked.
 
 Effect convention (the house rule)
   A side effect is legitimate only if (a) it is the function's stated job —
@@ -186,11 +196,15 @@ class Coordinator:
                 of discovery (DAGs, repeated seeds) at ~100-200 B per task
                 ever registered; make keys compact (a 128-bit digest beats a
                 path).
-      "parent"  a key is remembered only against the pending parent that
-                begot it and is forgotten when that parent retires — exact
-                for tree-shaped discovery (each child has one parent: a
-                filesystem walk that does not follow symlinks), and nothing
-                is retained per completed task. Seeds are not deduped.
+      "parent"  a key is remembered only in the scope of the parent that
+                begot it, which lives while the parent is pending or any of
+                its begets is still being expanded — exact for tree-shaped
+                discovery (each child has one parent: a filesystem walk that
+                does not follow symlinks), and nothing is retained per
+                completed task. Seeds are not deduped.
+    `seeds` runs in the coordinator's feeder thread and `expand` in its
+    sender thread, one child at a time as children are dispatched; neither
+    may assume the other's thread.
     """
 
     seeds: Callable[[], Iterator[Spec]]
@@ -317,7 +331,7 @@ class _Task:
     spec: Spec
     attempts: int = 0
     deadline: float = math.inf
-    children: set[Hashable] | None = None   # begotten keys (dedup="parent")
+    children: set[Hashable] | None = None   # dedup scope (dedup="parent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +342,7 @@ class Stats:
     tasks: int                              # registered (excludes deduped)
     done: int                               # completed
     failed: tuple[tuple[int, Spec], ...]    # (task id, spec)
+    deferred: int                           # begets parked unexpanded
     sealed: bool
 
 
@@ -365,7 +380,20 @@ class Failed:
     why: str
 
 
-Decision = Send | Retry | Failed
+@dataclass(frozen=True, slots=True)
+class Defer:
+    """
+    Decision: park a beget; its children are registered and dispatched
+    lazily, one at a time, deduped in `scope` (None under dedup="global").
+    """
+
+    task: int
+    spec: Spec
+    disc: Discovery
+    scope: set[Hashable] | None
+
+
+Decision = Send | Retry | Failed | Defer
 
 
 class Ledger:
@@ -379,9 +407,10 @@ class Ledger:
 
     Holds only PENDING tasks: a task's record is deleted the moment it
     completes or fails terminally, so late frames for it are no-ops (done,
-    error) or stale (a beget — spec_of returns None). What survives per
+    error) or stale (a beget — defer returns []). What survives per
     completed task is its dedup key under dedup="global", and nothing under
-    dedup="parent" (see Coordinator).
+    dedup="parent" (see Coordinator) — a parent's scope set is shared with
+    its parked begets and lives exactly as long as one of them does.
 
     Sans-I/O AND sans-strategy: frames-worth-of-data go in, frozen Decision
     values come out; it never writes a pipe, logs, or calls user code (`key_of`
@@ -409,6 +438,7 @@ class Ledger:
         self._seen: set[Hashable] = set()       # run-wide keys (dedup="global")
         self._next = 0
         self._registered = 0
+        self._deferred = 0                      # begets parked unexpanded
         self._outstanding = 1                   # the source token
         self._sealed = False
         self._done = 0
@@ -419,17 +449,17 @@ class Ledger:
     # -- public protocol -----------------------------------------------------
 
     def register(
-            self, spec: Spec, parent: int | None = None
+            self, spec: Spec, scope: set[Hashable] | None = None
         ) -> list[Decision]:
         """
-        Register one spec — a seed (no parent) or a child begotten by the
-        pending task `parent`; returns the Send to apply, or [] if key_of
-        dedups it: against every key of the run (dedup="global"), or against
-        what `parent` has already begotten (dedup="parent" — seeds, and
-        children of a parent that has since retired, are not deduped).
+        Register one spec — a seed (no scope) or a begotten child (the scope
+        its Defer carries); returns the Send to apply, or [] if key_of dedups
+        it: against every key of the run (dedup="global"), or against the
+        keys already in `scope` (dedup="parent" — seeds have no scope and
+        are not deduped).
         """
         with self._lock:
-            if self._key_of is not None and self._is_dup(spec, parent):
+            if self._key_of is not None and self._is_dup(spec, scope):
                 return []
             self._next += 1
             tid = self._next
@@ -439,6 +469,32 @@ class Ledger:
             self._outstanding += 1
             self._stamp(task)
             return [Send(task=tid, attempt=task.attempts, spec=spec)]
+
+    def defer(self, task_id: int, disc: Discovery) -> list[Decision]:
+        """
+        Park a beget of the PENDING task `task_id`: one Defer to apply, or []
+        if the task has retired (a stale beget). The beget holds an
+        outstanding token until release(), so the run cannot end while
+        children wait unexpanded, and it carries the parent's dedup scope so
+        late expansion still dedups against everything the parent begot —
+        even after the parent itself has retired.
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return []
+            if self._dedup == "parent" and task.children is None:
+                task.children = set()
+            self._outstanding += 1
+            self._deferred += 1
+            return [Defer(task=task_id, spec=task.spec, disc=disc,
+                          scope=task.children)]
+
+    def release(self) -> None:
+        """A parked beget is fully expanded (or dropped): return its token."""
+        with self._lock:
+            self._outstanding -= 1
+            self._deferred -= 1
 
     def sent(self, task_id: int, attempt: int, now: float) -> None:
         """
@@ -526,24 +582,21 @@ class Ledger:
             return Stats(
                 outstanding=self._outstanding, tasks=self._registered,
                 done=self._done, failed=tuple(self._failed),
-                sealed=self._sealed
+                deferred=self._deferred, sealed=self._sealed
             )
 
     # -- internals (call only with self._lock held) ---------------------------
 
-    def _is_dup(self, spec: Spec, parent: int | None) -> bool:
+    def _is_dup(self, spec: Spec, scope: set[Hashable] | None) -> bool:
         """Consult, and update, the key set in scope; True if seen before."""
         assert self._key_of is not None
         key = self._key_of(spec)
         if self._dedup == "global":
             seen = self._seen
+        elif scope is None:
+            return False                    # a seed: nothing to dedup against
         else:
-            owner = self._tasks.get(parent) if parent is not None else None
-            if owner is None:
-                return False                # seed, or parent already retired
-            if owner.children is None:
-                owner.children = set()
-            seen = owner.children
+            seen = scope
         if key in seen:
             return True
         seen.add(key)
@@ -580,17 +633,31 @@ class Ledger:
 # ---------------------------------------------------------------------------
 # coordinator — stateless wiring around the ledger and the strategy
 
+@dataclass(slots=True)
+class _Expansion:
+    """A parked beget in the outbox, expanded one child per pop by the
+    sender; `children` is expand()'s iterator once drawing has begun."""
+
+    defer: Defer
+    children: Iterator[Spec] | None = None
+
+
+_Frame = tuple[int, int, Spec]              # (task, attempt, spec)
+_Item = _Frame | _Expansion
+
+
 class _Outbox:
     """
-    The coordinator's unbounded in-process queue of work frames, drained by
-    the sender thread (see Flow control). Its order IS the dispatch policy:
-    LIFO makes the walk depth-first, FIFO breadth-first (see Dispatch order
-    and memory). `peak` records the deepest it ever got — the frontier the
-    run had to hold in memory beyond the work pipe.
+    The coordinator's unbounded in-process queue of work frames and parked
+    begets, drained by the sender thread (see Flow control). Its order IS
+    the dispatch policy: LIFO makes the walk depth-first, FIFO breadth-first
+    (see Dispatch order and memory). `peak` records the deepest it ever got
+    — the frontier the run had to hold in memory beyond the work pipe, a
+    parked beget counting once however many children it still holds.
     """
 
     def __init__(self, depth_first: bool) -> None:
-        self._items: deque[tuple[int, int, Spec]] = deque()
+        self._items: deque[_Item] = deque()
         self._cv = threading.Condition()
         self._closed = False
         self._depth_first = depth_first
@@ -600,17 +667,17 @@ class _Outbox:
         with self._cv:
             return len(self._items)
 
-    def push(self, task: int, attempt: int, spec: Spec) -> None:
-        """Queue one frame. Never blocks: the outbox is unbounded."""
+    def push(self, item: _Item) -> None:
+        """Queue one frame or parked beget. Never blocks: it is unbounded."""
         with self._cv:
-            self._items.append((task, attempt, spec))
+            self._items.append(item)
             if len(self._items) > self.peak:
                 self.peak = len(self._items)
             self._cv.notify()
 
-    def pop(self) -> tuple[int, int, Spec] | None:
+    def pop(self) -> _Item | None:
         """
-        The next frame per the dispatch policy; blocks while empty. None
+        The next item per the dispatch policy; blocks while empty. None
         once closed AND empty — the sender's signal to stop.
         """
         with self._cv:
@@ -660,12 +727,17 @@ def _coordinator_watchdog(
 
 
 def _summarize(
-        name: str, stats: Stats, elapsed: float, outbox_peak: int
+        name: str, stats: Stats, elapsed: float, outbox_peak: int,
+        botched_begets: int
     ) -> int:
     """Final log lines + exit code: 1 if anything failed or never finished."""
     log(f"[{name}] done: {stats.tasks} tasks, {stats.done} completed, "
         f"{len(stats.failed)} failed, outbox peak {outbox_peak}, "
         f"{elapsed:.1f}s")
+
+    if botched_begets:
+        log(f"[{name}] {botched_begets} begets could not be expanded "
+            f"(expand()/key_of raised) — their children were never walked")
 
     if stats.outstanding > 0:
         pending = stats.outstanding - (0 if stats.sealed else 1)
@@ -681,7 +753,7 @@ def _summarize(
             log(f"[{name}]   ... +{len(stats.failed) - 10} more")
         return 1
 
-    return 0
+    return 1 if botched_begets else 0
 
 
 def _run_coordinator(
@@ -709,9 +781,17 @@ def _run_coordinator(
     finishing = threading.Event()
     finish_lock = threading.Lock()
     outbox = _Outbox(depth_first=cfg.depth_first)
+    botched_begets = 0
 
     with qpipe.Producer.connect(pipes.work, codec="json") as work, \
          qpipe.Consumer.connect(pipes.completions, codec="json") as control:
+
+        def draw(x: _Expansion) -> Spec | None:
+            """The next child of a parked beget, or None once exhausted."""
+            if x.children is None:
+                x.children = iter(
+                    coordinator.expand(x.defer.spec, x.defer.disc))
+            return next(x.children, None)
 
         def send_loop() -> None:
             """
@@ -719,15 +799,55 @@ def _run_coordinator(
             order; the blocking work.send() (a full orchestrator queue
             withholds its ACK) is confined here, where blocking is harmless,
             and a frame's deadline is armed only once its send has returned.
+
+            A parked beget is expanded here, one child per pop: the beget
+            goes back into the outbox first — beneath whatever the workers
+            discover meanwhile, so the walk stays depth-first — then the
+            child is registered (deduped in its parent's scope) and sent.
+            Its token is released once it is exhausted; if expand()/key_of
+            raise, the rest of that beget is dropped, loudly, and the run
+            ends with rc 1.
+
             Ends when the outbox is closed and empty. Should the pipe die,
-            every frame from then on is failed terminally instead of sent: an
-            unsent task has no deadline, so nothing else would ever retire
-            it, and the run still has to reach outstanding == 0 to end.
+            every frame from then on is failed terminally and every parked
+            beget dropped, instead of sent: an unsent task has no deadline,
+            so nothing else would ever retire it, and the run still has to
+            reach outstanding == 0 to end.
             """
+            nonlocal botched_begets
             dead: str | None = None
-            failed = 0
+            failed = dropped = 0
             while (item := outbox.pop()) is not None:
-                task, attempt, spec = item
+                if isinstance(item, _Expansion):
+                    if dead is not None:
+                        ledger.release()
+                        dropped += 1
+                        continue
+                    try:
+                        child = draw(item)
+                        decisions = [] if child is None else \
+                            ledger.register(child, scope=item.defer.scope)
+                    except Exception as e:  # noqa: BLE001 — strategy code
+                        log(f"[{name}] expand() failed for task "
+                            f"{item.defer.task} ({_short(item.defer.spec)}): "
+                            f"{type(e).__name__}: {e} — dropping the rest of "
+                            f"this beget")
+                        ledger.release()
+                        botched_begets += 1
+                        continue
+                    if child is None:               # exhausted
+                        ledger.release()
+                        if ledger.done():
+                            finish()
+                        continue
+                    outbox.push(item)               # back, under new arrivals
+                    if not decisions:               # a duplicate child
+                        continue
+                    [send] = decisions
+                    frame: _Frame = (send.task, send.attempt, send.spec)
+                else:
+                    frame = item
+                task, attempt, spec = frame
                 if dead is None:
                     try:
                         work.send(
@@ -743,24 +863,28 @@ def _run_coordinator(
                 failed += 1
             if failed:
                 log(f"[{name}] {failed} tasks failed undispatched")
+            if dropped:
+                log(f"[{name}] {dropped} begets dropped unexpanded")
 
         def apply(decision: Decision) -> None:
             """Interpret one ledger Decision — the algebra's only consumer."""
             match decision:
                 case Send(task=task, attempt=attempt, spec=spec):
-                    outbox.push(task, attempt, spec)
+                    outbox.push((task, attempt, spec))
                 case Retry(task=task, attempt=attempt, spec=spec, why=why):
                     log(f"[{name}] retry {attempt}/{cfg.max_attempts} "
                         f"task {task} ({_short(spec)}): {why}")
-                    outbox.push(task, attempt, spec)
+                    outbox.push((task, attempt, spec))
                 case Failed(task=task, attempts=attempts, spec=spec, why=why):
                     log(f"[{name}] FAILED task {task} after {attempts} "
                         f"attempts: {why} — {_short(spec)}")
+                case Defer():
+                    outbox.push(_Expansion(decision))
 
         def handle(msg: dict[str, Any]) -> list[Decision]:
             """
-            Turn one completions-pipe frame into Decisions (calls the
-            strategy's expand for begets).
+            Turn one completions-pipe frame into Decisions. A beget becomes
+            a Defer — the strategy's expand runs later, in the sender.
             """
             kind = msg.get("k")
             if kind == "done":
@@ -769,15 +893,8 @@ def _run_coordinator(
                 return ledger.fail_or_retry(
                     msg.get("task"), str(msg.get("why", "")),
                     permanent=bool(msg.get("permanent")))
-            if kind == "beget":
-                parent_id = msg.get("task")
-                parent = ledger.spec_of(parent_id)
-                if parent is None:
-                    return []           # stale beget: parent already retired
-                decisions: list[Decision] = []
-                for child in coordinator.expand(parent, msg.get("spec") or {}):
-                    decisions.extend(ledger.register(child, parent=parent_id))
-                return decisions
+            if kind == "beget":         # [] if stale: parent already retired
+                return ledger.defer(msg.get("task"), msg.get("spec") or {})
             return []
 
         def finish() -> None:
@@ -809,7 +926,7 @@ def _run_coordinator(
             s = ledger.stats()
             el = max(now - t0, 1e-9)
             log(f"[{name}] outstanding={s.outstanding} tasks={s.tasks} "
-                f"done={s.done} outbox={len(outbox)} "
+                f"done={s.done} outbox={len(outbox)} deferred={s.deferred} "
                 f"source={'sealed' if s.sealed else 'open'} "
                 f"({s.done / el:.0f}/s, {el:.0f}s)")
 
@@ -878,7 +995,7 @@ def _run_coordinator(
     finish()                        # no-op if the watchdog beat us to it
     return _summarize(
         name, ledger.stats(), elapsed=time.monotonic() - t0,
-        outbox_peak=outbox.peak
+        outbox_peak=outbox.peak, botched_begets=botched_begets
     )
 
 
