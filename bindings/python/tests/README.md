@@ -23,8 +23,9 @@ they can be deselected.
 dedup at either scope / complete / retry / fail, deadlines armed by `sent()`
 rather than by registration, terminal tasks leaving the ledger, a parked
 beget's `Defer` token and shared dedup scope) and the coordinator's `_Outbox`
-(LIFO = depth-first vs FIFO = breadth-first). Time is passed in; every
-expectation is an equality on a list of Decisions. Fast tier.
+(LIFO = depth-first vs FIFO = breadth-first), plus the memory-telemetry
+parsers (`/proc/self/cgroup` scope, `key value` files). Time is passed in;
+every expectation is an equality on a list of Decisions. Fast tier.
 
 ### test_work.py
 

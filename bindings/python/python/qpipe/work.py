@@ -111,6 +111,17 @@ Dispatch order and memory (--dispatch)
   costs the coordinator the names it was sent, not a million specs at once;
   the stat line's deferred= counts the begets still parked.
 
+Memory telemetry (--mem-every)
+  Every role logs, every --mem-every seconds (default 60; 0 turns it off; the
+  flag is shared by all four roles), what it can see of memory from
+  inside its own process: its RSS, the node's slab and available memory
+  (/proc/meminfo), and the job cgroup's charged anon/file/slab against its
+  limit (/sys/fs/cgroup, cut back to Slurm's job_* level). All of it is
+  readable unprivileged from inside a batch job, so a run's stderr answers
+  "where is the memory" on nodes nobody can log in to — including the
+  kernel memory a metadata-heavy walk leaves in the client's dentry, inode
+  and lock caches, which is charged to the job but belongs to no process.
+
 Effect convention (the house rule)
   A side effect is legitimate only if (a) it is the function's stated job —
   named I/O at the edge: run, send_loop, log, *_pipes, finish,
@@ -132,6 +143,7 @@ import time
 import signal
 import socket
 import argparse
+import resource
 import threading
 import subprocess
 
@@ -310,6 +322,165 @@ def shutdown_pipes(addrs: Sequence[str]) -> None:
             qpipe.request_shutdown(addr)
         except Exception:  # noqa: BLE001 — going down anyway
             pass
+
+
+# ---------------------------------------------------------------------------
+# memory telemetry — what a process can learn about memory from inside a job
+
+def _fmt_bytes(n: int) -> str:
+    """
+    Bytes as a compact figure for log lines: GiB to one decimal, MiB below.
+    """
+    return f"{n / 2**30:.1f}G" if n >= 2**30 else f"{n / 2**20:.0f}M"
+
+
+def _read_kv(path: str) -> dict[str, int]:
+    """
+    Parse a `key value [kB]` / `key: value kB` file (/proc/meminfo,
+    /proc/self/status, a cgroup memory.stat) into bytes per key. Lines
+    without an integer value are skipped.
+    """
+    out: dict[str, int] = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.replace(":", " ").split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                unit = 1024 if len(parts) > 2 and parts[2] == "kB" else 1
+                out[parts[0]] = int(parts[1]) * unit
+    return out
+
+
+def _read_int(path: str) -> int | None:
+    """A single-number file (memory.current, memory.max); None if absent, not
+    a number ("max"), or the no-limit sentinel cgroup v1 uses."""
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    if not text.isdigit() or int(text) >= 2**60:
+        return None
+    return int(text)
+
+
+def _cgroup_scope(text: str) -> tuple[str, str] | None:
+    """
+    From the content of /proc/self/cgroup, the memory cgroup worth
+    reporting: ("v2" | "v1", path), cut back to the first `job_*` component
+    when there is one — Slurm's job level, where the memory limit and the
+    OOM killer apply. None when no memory cgroup is listed.
+    """
+    for line in text.splitlines():
+        hid, _, rest = line.partition(":")
+        ctrls, _, path = rest.partition(":")
+        if hid == "0" and ctrls == "":
+            kind = "v2"
+        elif "memory" in ctrls.split(","):
+            kind = "v1"
+        else:
+            continue
+        parts = path.split("/")
+        for i, comp in enumerate(parts):
+            if comp.startswith("job_"):
+                path = "/".join(parts[:i + 1])
+                break
+        return kind, path
+    return None
+
+
+def _mem_report(root: str = "") -> str:
+    """
+    One line of memory facts as seen from inside this process: its own RSS,
+    the node's slab and available memory, and the job cgroup's charge
+    (anon / file / slab) against its limit. Best-effort — whatever /proc
+    and /sys do not offer is left out, so macOS gets the RSS alone. `root`
+    prefixes every path (tests point it at a fake /proc + /sys tree).
+    """
+    parts: list[str] = []
+    try:
+        rss = _read_kv(root + "/proc/self/status")["VmRSS"]
+        parts.append(f"rss={_fmt_bytes(rss)}")
+    except (OSError, KeyError):
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform != "darwin":
+            peak *= 1024                        # Linux reports kB
+        parts.append(f"rss<={_fmt_bytes(peak)}")
+    try:
+        mi = _read_kv(root + "/proc/meminfo")
+        parts.append(f"node: slab={_fmt_bytes(mi['Slab'])} "
+                     f"(reclaimable {_fmt_bytes(mi['SReclaimable'])}) "
+                     f"available={_fmt_bytes(mi['MemAvailable'])}")
+    except (OSError, KeyError):
+        pass
+    try:
+        with open(root + "/proc/self/cgroup") as f:
+            scope = _cgroup_scope(f.read())
+    except OSError:
+        scope = None
+    if scope is not None:
+        kind, path = scope
+        label = path.rsplit("/", 1)[-1] or "root"
+        try:
+            if kind == "v2":
+                base = root + "/sys/fs/cgroup" + path
+                st = _read_kv(base + "/memory.stat")
+                cur, lim = _read_int(base + "/memory.current"), \
+                    _read_int(base + "/memory.max")
+                parts.append(
+                    f"cgroup {label}: current={_fmt_bytes(cur or 0)}"
+                    f"{'/' + _fmt_bytes(lim) if lim else ''} "
+                    f"anon={_fmt_bytes(st.get('anon', 0))} "
+                    f"file={_fmt_bytes(st.get('file', 0))} "
+                    f"slab={_fmt_bytes(st.get('slab', 0))}")
+            else:
+                base = root + "/sys/fs/cgroup/memory" + path
+                st = _read_kv(base + "/memory.stat")
+                cur = _read_int(base + "/memory.usage_in_bytes")
+                lim = _read_int(base + "/memory.limit_in_bytes")
+                kmem = _read_int(base + "/memory.kmem.usage_in_bytes")
+                rss = st.get("total_rss", st.get("rss", 0))
+                cache = st.get("total_cache", st.get("cache", 0))
+                kern = f" kernel={_fmt_bytes(kmem)}" if kmem is not None else ""
+                parts.append(
+                    f"cgroup {label}: usage={_fmt_bytes(cur or 0)}"
+                    f"{'/' + _fmt_bytes(lim) if lim else ''} "
+                    f"rss={_fmt_bytes(rss)} cache={_fmt_bytes(cache)}{kern}")
+        except OSError:
+            pass
+    return " | ".join(parts)
+
+
+def _child_rss(pid: int) -> str:
+    """A child process's RSS from /proc, or "?" where /proc is absent."""
+    try:
+        return _fmt_bytes(_read_kv(f"/proc/{pid}/status")["VmRSS"])
+    except (OSError, KeyError):
+        return "?"
+
+
+def _mem_reporter(
+        tag: str, every: float, extra: Callable[[], str] = lambda: ""
+    ) -> threading.Event:
+    """
+    Start one role's memory telemetry: a daemon thread logging
+    `[tag] mem: ...` every `every` seconds until the returned Event is set.
+    `extra` prefixes each line with role-specific facts (the bus adds its
+    orchestrators' RSS). every <= 0 starts nothing and returns an Event
+    that is already set, so callers stop it unconditionally.
+
+    Side effects (its entire job): stderr on a timer, from its own thread.
+    """
+    stop = threading.Event()
+    if every <= 0:
+        stop.set()
+        return stop
+
+    def run() -> None:
+        while not stop.wait(every):
+            log(f"[{tag}] mem: {extra()}{_mem_report()}")
+
+    threading.Thread(target=run, daemon=True, name=f"{tag}-mem").start()
+    return stop
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +928,8 @@ def _summarize(
 
 
 def _run_coordinator(
-        name: str, pipes: Pipes, cfg: CoordinatorCfg, coordinator: Coordinator
+        name: str, pipes: Pipes, cfg: CoordinatorCfg, coordinator: Coordinator,
+        mem_every: float = 0.0
     ) -> int:
     """
     Coordinator entry point: feed seeds, apply the ledger's decisions until
@@ -769,6 +941,7 @@ def _run_coordinator(
         (pipes.work, pipes.completions, pipes.results), timeout=pipes.wait
     )
     log(f"[{name}] coordinator up")
+    stop_mem = _mem_reporter(name, mem_every)
 
     ledger = Ledger(
         key_of=coordinator.key_of, task_timeout=cfg.task_timeout,
@@ -989,6 +1162,7 @@ def _run_coordinator(
 
         finally:
             loop_done.set()
+            stop_mem.set()
             outbox.close()
             sender.join(timeout=5.0)    # flush stragglers before the drain
 
@@ -1002,13 +1176,17 @@ def _run_coordinator(
 # ---------------------------------------------------------------------------
 # worker — drive the strategy, own the protocol envelopes
 
-def _worker_loop(name: str, pipes: Pipes, worker: Worker, wid: str) -> None:
+def _worker_loop(
+        name: str, pipes: Pipes, worker: Worker, wid: str,
+        on_done: Callable[[], None] = lambda: None
+    ) -> None:
     """
     One consume → process → report loop. The result-before-done and
     beget-before-done orderings live here, not in process(): the `done` frame
     is sent only after process() returns, and result()/discover() have already
     ACKed. QpipeError propagates (pipes going away); Permanent becomes a
-    non-retryable error frame, anything else a retryable one.
+    non-retryable error frame, anything else a retryable one. `on_done` is
+    called once per completed task — the process-level tally.
     """
     state = worker.setup()
     n = 0
@@ -1057,46 +1235,78 @@ def _worker_loop(name: str, pipes: Pipes, worker: Worker, wid: str) -> None:
                 "duration": round(time.monotonic() - t0, 3)
             })
             n += 1
+            on_done()
 
     log(f"[{name} worker {wid}] {n} tasks")
 
 
-def _run_worker(name: str, pipes: Pipes, worker: Worker, threads: int) -> int:
+def _run_worker(
+        name: str, pipes: Pipes, worker: Worker, threads: int,
+        report_every: float = 0.0, mem_every: float = 0.0
+    ) -> int:
     """
     Worker entry point: spin `threads` independent loops and wait them out.
-    Exit codes: 0 clean, 130 interrupted.
+    With report_every > 0 a reporter thread logs the process's task tally on
+    that cadence; mem_every is the memory telemetry's (see Memory
+    telemetry). Exit codes: 0 clean, 130 interrupted.
     """
     wait_for_pipes(
         (pipes.work, pipes.completions, pipes.results), timeout=pipes.wait
     )
     base = f"{socket.gethostname()}:{os.getpid()}"
+    done = [0] * threads                # one slot per loop: no lock needed
+    finished = threading.Event()
+    stop_mem = _mem_reporter(f"{name} worker", mem_every)
 
     def boot(i: int) -> None:
         """Run one loop; downgrade expected shutdown races to a log line."""
         wid = f"{base}.{i}"
+
+        def tally() -> None:
+            done[i] += 1
+
         try:
-            _worker_loop(name, pipes, worker, wid)
+            _worker_loop(name, pipes, worker, wid, on_done=tally)
         except qpipe.QpipeError as e:
             log(f"[{name} worker {wid}] pipe closed: {e}")
         except Exception as e:      # noqa: BLE001
             log(f"[{name} worker {wid}] fatal: {type(e).__name__}: {e}")
 
+    def report() -> None:
+        """Progress line every report_every seconds until the pool is done."""
+        t0 = time.monotonic()
+        while not finished.wait(report_every):
+            el, n = time.monotonic() - t0, sum(done)
+            log(f"[{name} worker] {n} tasks ({n / el:.0f}/s, {el:.0f}s)")
+
     pool = [threading.Thread(target=boot, args=(i,), daemon=True)
             for i in range(threads)]
     for t in pool:
         t.start()
+    if report_every > 0:
+        threading.Thread(target=report, daemon=True).start()
     try:
         for t in pool:
             t.join()
     except KeyboardInterrupt:
         return 130
+    finally:
+        finished.set()
+        stop_mem.set()
+    if report_every > 0:
+        log(f"[{name} worker] done: {sum(done)} tasks")
+    if mem_every > 0:
+        log(f"[{name} worker] mem at exit: {_mem_report()}")
     return 0
 
 
 # ---------------------------------------------------------------------------
 # collect — drain the results pipe to JSONL
 
-def _run_collect(results_addr: str, wait: float, output: str | None) -> int:
+def _run_collect(
+        results_addr: str, wait: float, output: str | None,
+        mem_every: float = 0.0
+    ) -> int:
     """
     Collect entry point: stream the results pipe to JSONL on stdout or
     `output`.
@@ -1110,6 +1320,7 @@ def _run_collect(results_addr: str, wait: float, output: str | None) -> int:
     out = sys.stdout.buffer if output in (None, "-") else open(output, "wb")
     n = 0
     t0 = time.monotonic()
+    stop_mem = _mem_reporter("collect", mem_every)
 
     try:
         with qpipe.Consumer.connect(results_addr, codec="raw") as recs:
@@ -1121,6 +1332,7 @@ def _run_collect(results_addr: str, wait: float, output: str | None) -> int:
                     el = time.monotonic() - t0
                     log(f"[collect] {n} results ({n / el:.0f}/s)")
     finally:
+        stop_mem.set()
         if out is not sys.stdout.buffer:
             out.close()
 
@@ -1210,6 +1422,13 @@ def _bus_healthy(
     return True
 
 
+def _orchestrator_rss(procs: dict[str, subprocess.Popen[str]]) -> str:
+    """The bus's prefix for its mem: line: each live orchestrator's RSS."""
+    live = " ".join(f"{n}={_child_rss(p.pid)}"
+                    for n, p in procs.items() if p.poll() is None)
+    return f"orchestrators: {live} | " if live else ""
+
+
 def _supervise_bus(procs: dict[str, subprocess.Popen[str]]) -> int:
     """
     Wait for every orchestrator; the first NONZERO exit tears the survivors
@@ -1236,7 +1455,10 @@ def _supervise_bus(procs: dict[str, subprocess.Popen[str]]) -> int:
     return 0
 
 
-def _run_bus(pipes: Pipes, rust_log: str, orchestrator: str) -> int:
+def _run_bus(
+        pipes: Pipes, rust_log: str, orchestrator: str,
+        mem_every: float = 0.0
+    ) -> int:
     """
     Bus entry point: spawn one orchestrator per pipe, gate on their
     healthchecks (--wait budget), supervise until they exit.
@@ -1273,6 +1495,7 @@ def _run_bus(pipes: Pipes, rust_log: str, orchestrator: str) -> int:
     procs: dict[str, subprocess.Popen[str]] = {}
     pumps: list[threading.Thread] = []
     write_lock = threading.Lock()
+    stop_mem = _mem_reporter("bus", mem_every, lambda: _orchestrator_rss(procs))
 
     try:
         for name, addr in addrs.items():
@@ -1309,6 +1532,7 @@ def _run_bus(pipes: Pipes, rust_log: str, orchestrator: str) -> int:
         log("[bus] interrupted — stopping orchestrators")
         return 130
     finally:
+        stop_mem.set()
         stop_orchestrators(procs)       # children die -> pipes EOF
         for pump in pumps:              # drain the tails, then the pumps end
             pump.join(timeout=2.0)
@@ -1322,7 +1546,7 @@ def add_pipe_args(
     ) -> None:
     """
     Register --work/--completions/--results overrides (defaults from the
-    pipeline) plus the shared --wait.
+    pipeline) plus the flags every role shares: --wait and --mem-every.
     """
     for n in names:
         d = getattr(defaults, n)
@@ -1333,6 +1557,11 @@ def add_pipe_args(
     p.add_argument(
         "--wait", type=float, default=defaults.wait,
         help=f"seconds to wait for pipes (default {defaults.wait:g})"
+    )
+    p.add_argument(
+        "--mem-every", type=float, default=60.0, metavar="SECONDS",
+        help="log a mem: line (this process's RSS, the node's slab, the job "
+             "cgroup's charge) this often; 0 turns it off (default 60)"
     )
 
 
@@ -1378,6 +1607,10 @@ def _build_parser(pipeline: Pipeline) -> argparse.ArgumentParser:
         "--threads", type=int, default=4,
         help="independent worker loops in this process (default 4)"
     )
+    w.add_argument(
+        "--report-every", type=float, default=60.0,
+        help="seconds between progress lines, 0 = off (default 60)"
+    )
     pipeline.add_worker_args(w)
     add_pipe_args(w, d, "work", "completions", "results")
 
@@ -1416,21 +1649,24 @@ def run(pipeline: Pipeline, argv: list[str] | None = None) -> int:
     if args.role == "coordinator":
         return _run_coordinator(
             pipeline.name, Pipes.from_args(args), CoordinatorCfg.from_args(args),
-            pipeline.make_coordinator(args)
+            pipeline.make_coordinator(args), mem_every=args.mem_every
         )
 
     if args.role == "worker":
         return _run_worker(
             pipeline.name, Pipes.from_args(args), pipeline.make_worker(args),
-            args.threads
+            args.threads, report_every=args.report_every,
+            mem_every=args.mem_every
         )
 
     if args.role == "collect":
-        return _run_collect(args.results, args.wait, args.output)
+        return _run_collect(args.results, args.wait, args.output,
+                            mem_every=args.mem_every)
 
     if args.role == "bus":
         return _run_bus(
-            Pipes.from_args(args), args.rust_log, args.orchestrator
+            Pipes.from_args(args), args.rust_log, args.orchestrator,
+            mem_every=args.mem_every
         )
 
     raise AssertionError(f"unhandled role {args.role!r}")  # unreachable

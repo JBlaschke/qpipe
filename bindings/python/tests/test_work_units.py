@@ -9,7 +9,10 @@ is an equality on a list of Decisions.
 """
 
 import pytest
-from qpipe.work import Defer, Failed, Ledger, Retry, Send, _Outbox
+from qpipe.work import (
+    Defer, Failed, Ledger, Retry, Send, _Outbox, _cgroup_scope, _mem_report,
+    _mem_reporter, _read_kv,
+)
 
 T = 10.0    # task timeout used throughout
 
@@ -250,3 +253,112 @@ def test_dispatch_flag_maps_to_cfg():
     assert CoordinatorCfg.from_args(ap.parse_args(["coordinator"])).depth_first
     assert not CoordinatorCfg.from_args(
         ap.parse_args(["coordinator", "--dispatch", "breadth"])).depth_first
+
+
+def test_mem_every_is_a_flag_on_every_role():
+    from qpipe.work import Pipeline, Pipes, _build_parser
+    pipes = Pipes("a", "b", "c", 1.0)
+    pl = Pipeline(name="t", describe="", default_pipes=pipes,
+                  make_coordinator=lambda a: None, make_worker=lambda a: None)
+    ap = _build_parser(pl)
+    for role in ("coordinator", "worker", "collect", "bus"):
+        assert ap.parse_args([role]).mem_every == 60.0
+        assert ap.parse_args([role, "--mem-every", "0"]).mem_every == 0.0
+
+
+# ---------------------------------------------------------------------------
+# memory telemetry
+
+def test_cgroup_scope_cuts_back_to_the_slurm_job_level():
+    v2 = "0::/system.slice/slurmstepd.scope/job_12345/step_0/user/task_0\n"
+    assert _cgroup_scope(v2) == \
+        ("v2", "/system.slice/slurmstepd.scope/job_12345")
+    v1 = ("12:pids:/slurm/uid_1000/job_777/step_batch\n"
+          "4:memory:/slurm/uid_1000/job_777/step_batch/task_0\n"
+          "1:name=systemd:/user.slice\n")
+    assert _cgroup_scope(v1) == ("v1", "/slurm/uid_1000/job_777")
+    plain = "0::/user.slice/user-1000.slice/session-3.scope\n"
+    assert _cgroup_scope(plain) == \
+        ("v2", "/user.slice/user-1000.slice/session-3.scope")
+    assert _cgroup_scope("3:cpu:/a\n") is None
+    assert _cgroup_scope("") is None
+
+
+def test_read_kv_understands_meminfo_status_and_cgroup_stat(tmp_path):
+    f = tmp_path / "mixed"
+    f.write_text("MemTotal:       65536 kB\nVmRSS:\t  2048 kB\nanon 4096\n"
+                 "slab_reclaimable 10\nMemAvailable:   1 kB\nnote no-number\n")
+    assert _read_kv(str(f)) == {"MemTotal": 65536 * 1024, "VmRSS": 2048 * 1024,
+                                "anon": 4096, "slab_reclaimable": 10,
+                                "MemAvailable": 1024}
+
+
+def test_mem_report_is_best_effort():
+    line = _mem_report()
+    assert line.startswith("rss")          # at least the process itself
+    assert "\n" not in line
+
+
+def fake_tree(root, files):
+    for rel, text in files.items():
+        f = root / rel.lstrip("/")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    return str(root)
+
+
+def test_mem_report_reads_a_cgroup_v2_slurm_job(tmp_path):
+    job = "/system.slice/slurmstepd.scope/job_42"
+    root = fake_tree(tmp_path, {
+        "/proc/self/status": ("Name:\tpython3\nVmRSS:\t 1048576 kB\n"
+                              "Threads:\t5\n"),
+        "/proc/meminfo": ("MemTotal:       134217728 kB\n"
+                          "MemAvailable:    62914560 kB\n"
+                          "Slab:            44040192 kB\n"
+                          "SReclaimable:    41943040 kB\n"),
+        "/proc/self/cgroup": f"0::{job}/step_0/user/task_0\n",
+        f"/sys/fs/cgroup{job}/memory.stat": ("anon 2147483648\nfile 536870912\n"
+                                              "slab 44023414784\n"),
+        f"/sys/fs/cgroup{job}/memory.current": "46708523008\n",
+        f"/sys/fs/cgroup{job}/memory.max": "68719476736\n",
+    })
+    assert _mem_report(root) == (
+        "rss=1.0G | node: slab=42.0G (reclaimable 40.0G) available=60.0G | "
+        "cgroup job_42: current=43.5G/64.0G anon=2.0G file=512M slab=41.0G")
+
+
+def test_mem_report_reads_a_cgroup_v1_slurm_job_without_a_limit(tmp_path):
+    job = "/slurm/uid_1000/job_7"
+    root = fake_tree(tmp_path, {
+        "/proc/self/status": "VmRSS:\t 524288 kB\n",
+        "/proc/meminfo": ("MemAvailable: 1048576 kB\nSlab: 2097152 kB\n"
+                          "SReclaimable: 1048576 kB\n"),
+        "/proc/self/cgroup": (f"12:pids:{job}/step_0/task_0\n"
+                              f"4:memory:{job}/step_0/task_0\n"),
+        f"/sys/fs/cgroup/memory{job}/memory.stat": ("total_rss 1073741824\n"
+                                                    "total_cache 536870912\n"),
+        f"/sys/fs/cgroup/memory{job}/memory.usage_in_bytes": "3221225472\n",
+        f"/sys/fs/cgroup/memory{job}/memory.limit_in_bytes":
+            "9223372036854771712\n",             # the no-limit sentinel
+        f"/sys/fs/cgroup/memory{job}/memory.kmem.usage_in_bytes":
+            "2147483648\n",
+    })
+    assert _mem_report(root) == (
+        "rss=512M | node: slab=2.0G (reclaimable 1.0G) available=1.0G | "
+        "cgroup job_7: usage=3.0G rss=1.0G cache=512M kernel=2.0G")
+
+
+def test_mem_report_without_proc_falls_back_to_the_process_peak(tmp_path):
+    line = _mem_report(str(tmp_path))       # empty root: no /proc, no /sys
+    assert line.startswith("rss<=") and "|" not in line
+
+
+def test_mem_reporter_is_off_at_zero_and_stops_when_told(capsys):
+    off = _mem_reporter("t", 0)
+    assert off.is_set()                     # nothing started, safe to set again
+    stop = _mem_reporter("t", 0.02)
+    import time
+    time.sleep(0.15)
+    stop.set()
+    lines = [l for l in capsys.readouterr().err.splitlines() if "[t] mem:" in l]
+    assert lines and all(l.startswith("[t] mem: rss") for l in lines)
